@@ -1,0 +1,91 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AuditRunStatus {
+  PROCESSING
+  SUCCESS
+  SUCCESS_WITH_WARNING
+  FAILED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  UNKNOWN
+}
+
+enum DuplicateMatchType {
+  SHA256
+  PERCEPTUAL_HASH
+  TRANSACTION_ID
+  COMPOSITE
+}
+
+model ApprovalAuditRun {
+  id           String         @id @default(cuid())
+  instanceCode String         @unique
+  status       AuditRunStatus
+  errorMessage String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@map("approval_audit_runs")
+}
+
+model PaymentEvidence {
+  id             String           @id @default(cuid())
+  instanceCode   String
+  applicantId    String?
+  applicantName  String?
+  approvalName   String?
+  approvalAmount Decimal          @db.Decimal(18, 2)
+  ocrAmount      Decimal?         @db.Decimal(18, 2)
+  amountMatched  Boolean
+  transactionId  String?
+  paidAt         DateTime?
+  payee          String?
+  fileName       String
+  mimeType       String?
+  fileSize       Int?
+  storageKey     String?
+  sha256         String
+  perceptualHash String?
+  ocrRawText     String?
+  ocrConfidence  Float
+  riskLevel      RiskLevel
+  riskReasons    Json
+  createdAt      DateTime         @default(now())
+
+  duplicateMatchesCurrent DuplicateMatch[] @relation("currentEvidence")
+  duplicateMatchesMatched DuplicateMatch[] @relation("matchedEvidence")
+
+  @@index([instanceCode])
+  @@index([sha256])
+  @@index([transactionId])
+  @@index([approvalAmount, paidAt, payee])
+  @@map("payment_evidences")
+}
+
+model DuplicateMatch {
+  id                String             @id @default(cuid())
+  currentEvidenceId String
+  matchedEvidenceId String
+  matchType         DuplicateMatchType
+  score             Float
+  reason            String
+  createdAt         DateTime           @default(now())
+
+  currentEvidence PaymentEvidence @relation("currentEvidence", fields: [currentEvidenceId], references: [id], onDelete: Cascade)
+  matchedEvidence PaymentEvidence @relation("matchedEvidence", fields: [matchedEvidenceId], references: [id], onDelete: Cascade)
+
+  @@index([currentEvidenceId])
+  @@index([matchedEvidenceId])
+  @@map("duplicate_matches")
+}
