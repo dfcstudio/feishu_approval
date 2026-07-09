@@ -45,6 +45,7 @@ export const parseApprovalForm = (
 
   return {
     instanceCode: detail.instanceCode,
+    serialNumber: detail.serialNumber,
     approvalName: detail.approvalName,
     applicantId: applicant.id ?? detail.applicantId,
     applicantName: applicant.name ?? detail.applicantName,
@@ -65,6 +66,11 @@ const normalizeFieldNode = (node: unknown): FormField[] => {
 
   const nested = parsed.children ?? parsed.items ?? parsed.value_list ?? parsed.valueList;
   const nestedFields = Array.isArray(nested) ? nested.flatMap((child) => normalizeFieldNode(child)) : [];
+  const valueRows = Array.isArray(parsed.value)
+    ? parsed.value.flatMap((row: unknown) =>
+        Array.isArray(row) ? row.flatMap((item: unknown) => normalizeFieldNode(item)) : [],
+      )
+    : [];
 
   const name = firstString(parsed, [
     "name",
@@ -86,7 +92,7 @@ const normalizeFieldNode = (node: unknown): FormField[] => {
     parsed.option ??
     parsed;
 
-  return [{ name, value: parseMaybeJson(value), raw: parsed }, ...nestedFields];
+  return [{ name, value: parseMaybeJson(value), raw: parsed }, ...nestedFields, ...valueRows];
 };
 
 const normalizeAttachments = (input: unknown): NormalizedAttachment[] => {
@@ -97,6 +103,9 @@ const normalizeAttachments = (input: unknown): NormalizedAttachment[] => {
 
 const extractAttachmentCandidates = (input: unknown): NormalizedAttachment[] => {
   const parsed = parseMaybeJson(input);
+  if (typeof parsed === "string" && parsed.trim()) {
+    return [{ fileToken: parsed.trim(), name: undefined, mimeType: undefined, size: undefined, raw: parsed }];
+  }
   if (!isRecord(parsed)) return [];
 
   const token = firstString(parsed, [

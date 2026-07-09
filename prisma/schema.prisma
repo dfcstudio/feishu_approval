@@ -66,6 +66,7 @@ model PaymentEvidence {
   duplicateMatchesCurrent DuplicateMatch[] @relation("currentEvidence")
   duplicateMatchesMatched DuplicateMatch[] @relation("matchedEvidence")
 
+  @@unique([instanceCode, sha256])
   @@index([instanceCode])
   @@index([sha256])
   @@index([transactionId])
@@ -85,6 +86,7 @@ model DuplicateMatch {
   currentEvidence PaymentEvidence @relation("currentEvidence", fields: [currentEvidenceId], references: [id], onDelete: Cascade)
   matchedEvidence PaymentEvidence @relation("matchedEvidence", fields: [matchedEvidenceId], references: [id], onDelete: Cascade)
 
+  @@unique([currentEvidenceId, matchedEvidenceId, matchType])
   @@index([currentEvidenceId])
   @@index([matchedEvidenceId])
   @@map("duplicate_matches")

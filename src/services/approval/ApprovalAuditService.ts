@@ -8,6 +8,7 @@ import type { DedupeService, DuplicateMatchResult } from "../dedupe/DedupeServic
 import { HashService } from "../dedupe/HashService.js";
 import { ImageHashService } from "../dedupe/ImageHashService.js";
 import type { FeishuClient } from "../feishu/FeishuClient.js";
+import type { ParsedApprovalForm } from "../feishu/feishuTypes.js";
 import type { OCRProvider } from "../ocr/OCRProvider.js";
 import type { StorageProvider } from "../storage/StorageProvider.js";
 import type { FeishuNotifyService } from "../notify/FeishuNotifyService.js";
@@ -39,11 +40,11 @@ export class ApprovalAuditService {
     },
   ) {}
 
-  async audit(instanceCode: string): Promise<ApprovalAuditResult> {
+  async audit(instanceCode: string, saveFiles = true): Promise<ApprovalAuditResult> {
     const db = this.deps.db ?? prisma;
     const config = this.deps.config ?? env;
     const existing = await db.approvalAuditRun.findUnique({ where: { instanceCode } });
-    if (existing?.status === "SUCCESS" || existing?.status === "SUCCESS_WITH_WARNING") {
+    if (!saveFiles && (existing?.status === "SUCCESS" || existing?.status === "SUCCESS_WITH_WARNING")) {
       return { skipped: true, evidenceIds: [] };
     }
 
@@ -53,10 +54,12 @@ export class ApprovalAuditService {
       update: { status: "PROCESSING", errorMessage: null },
     });
 
+    let approval: ParsedApprovalForm | undefined;
     try {
       const detail = await this.deps.feishuClient.getApprovalInstanceDetail(instanceCode);
-      const approval = parseApprovalForm(detail, config);
+      approval = parseApprovalForm(detail, config);
       const evidenceIds: string[] = [];
+      const notificationWarnings: string[] = [];
 
       for (const attachment of approval.attachments) {
         const fileBuffer = await this.deps.feishuClient.downloadApprovalFile(attachment);
@@ -66,9 +69,47 @@ export class ApprovalAuditService {
         const perceptualHash = await (this.deps.imageHashService ?? new ImageHashService()).perceptualHash(
           fileBuffer,
         );
-        const storage = config.SAVE_ORIGINAL_FILE
+        const existingEvidence = saveFiles
+          ? await db.paymentEvidence.findFirst({
+              where: { instanceCode: approval.instanceCode, sha256 },
+              select: { id: true, storageKey: true },
+            })
+          : null;
+
+        if (existingEvidence?.storageKey) {
+          evidenceIds.push(existingEvidence.id);
+          continue;
+        }
+
+        const storage = config.SAVE_ORIGINAL_FILE && saveFiles
           ? await this.deps.storageProvider.save({ buffer: fileBuffer, fileName, mimeType })
           : { storageKey: null, size: fileBuffer.byteLength };
+
+        if (existingEvidence) {
+          await db.paymentEvidence.update({
+            where: { id: existingEvidence.id },
+            data: {
+              fileName,
+              mimeType,
+              fileSize: attachment.size ?? storage.size,
+              storageKey: storage.storageKey,
+              perceptualHash,
+            },
+          });
+          if (storage.storageKey) {
+            const notificationWarning = await notifyBestEffort(() =>
+              this.deps.notifyService.sendOriginalFileSaved({
+                serialNumber: approval?.serialNumber,
+                instanceCode: approval?.instanceCode ?? instanceCode,
+                fileName,
+                storageKey: storage.storageKey,
+              }),
+            );
+            if (notificationWarning) notificationWarnings.push(notificationWarning);
+          }
+          evidenceIds.push(existingEvidence.id);
+          continue;
+        }
 
         const ocr = await this.deps.ocrProvider.recognizePaymentEvidence({
           fileBuffer,
@@ -83,30 +124,64 @@ export class ApprovalAuditService {
           duplicateMatches: [],
         });
 
-        const evidence = await db.paymentEvidence.create({
-          data: {
-            instanceCode: approval.instanceCode,
-            applicantId: approval.applicantId,
-            applicantName: approval.applicantName,
-            approvalName: approval.approvalName,
-            approvalAmount: approval.approvalAmount,
-            ocrAmount: ocr.amount,
-            amountMatched,
-            transactionId: ocr.transactionId,
-            paidAt,
-            payee: ocr.payee,
-            fileName,
-            mimeType,
-            fileSize: attachment.size ?? storage.size,
-            storageKey: storage.storageKey,
-            sha256,
-            perceptualHash,
-            ocrRawText: config.SAVE_OCR_RAW_TEXT ? ocr.rawText : null,
-            ocrConfidence: ocr.confidence,
-            riskLevel: initialRisk.riskLevel,
-            riskReasons: initialRisk.riskReasons,
-          },
-        });
+        let evidence: { id: string };
+        try {
+          evidence = await db.paymentEvidence.create({
+            data: {
+              instanceCode: approval.instanceCode,
+              applicantId: approval.applicantId,
+              applicantName: approval.applicantName,
+              approvalName: approval.approvalName,
+              approvalAmount: approval.approvalAmount,
+              ocrAmount: ocr.amount,
+              amountMatched,
+              transactionId: ocr.transactionId,
+              paidAt,
+              payee: ocr.payee,
+              fileName,
+              mimeType,
+              fileSize: attachment.size ?? storage.size,
+              storageKey: storage.storageKey,
+              sha256,
+              perceptualHash,
+              ocrRawText: config.SAVE_OCR_RAW_TEXT ? ocr.rawText : null,
+              ocrConfidence: ocr.confidence,
+              riskLevel: initialRisk.riskLevel,
+              riskReasons: initialRisk.riskReasons,
+            },
+            select: { id: true },
+          });
+        } catch (error) {
+          if (!isUniqueConstraintError(error)) throw error;
+          const duplicateEvidence = await db.paymentEvidence.findFirst({
+            where: { instanceCode: approval.instanceCode, sha256 },
+            select: { id: true, storageKey: true },
+          });
+          if (!duplicateEvidence) throw error;
+          if (storage.storageKey && !duplicateEvidence.storageKey) {
+            await db.paymentEvidence.update({
+              where: { id: duplicateEvidence.id },
+              data: {
+                fileName,
+                mimeType,
+                fileSize: attachment.size ?? storage.size,
+                storageKey: storage.storageKey,
+                perceptualHash,
+              },
+            });
+            const notificationWarning = await notifyBestEffort(() =>
+              this.deps.notifyService.sendOriginalFileSaved({
+                serialNumber: approval?.serialNumber,
+                instanceCode: approval?.instanceCode ?? instanceCode,
+                fileName,
+                storageKey: storage.storageKey,
+              }),
+            );
+            if (notificationWarning) notificationWarnings.push(notificationWarning);
+          }
+          evidenceIds.push(duplicateEvidence.id);
+          continue;
+        }
 
         const duplicateMatches = await this.deps.dedupeService.findAndPersistMatches({
           currentEvidenceId: evidence.id,
@@ -131,30 +206,42 @@ export class ApprovalAuditService {
           },
         });
 
-        await this.deps.notifyService.sendAuditResult({
-          approvalName: approval.approvalName,
-          instanceCode: approval.instanceCode,
-          applicantName: approval.applicantName,
-          approvalAmount: approval.approvalAmount,
-          ocrAmount: ocr.amount,
-          amountMatched: ocr.amount ? amountMatched : null,
-          transactionId: ocr.transactionId,
-          paidAt,
-          payee: ocr.payee,
-          riskLevel: finalRisk.riskLevel,
-          riskReasons: finalRisk.riskReasons,
-          duplicateMatches,
-        });
+        const notificationWarning = await notifyBestEffort(() =>
+          this.deps.notifyService.sendAuditResult({
+            serialNumber: approval?.serialNumber,
+            approvalName: approval?.approvalName,
+            instanceCode: approval?.instanceCode ?? instanceCode,
+            applicantName: approval?.applicantName,
+            approvalAmount: approval?.approvalAmount ?? "0.00",
+            ocrAmount: ocr.amount,
+            amountMatched: ocr.amount ? amountMatched : null,
+            transactionId: ocr.transactionId,
+            paidAt,
+            payee: ocr.payee,
+            riskLevel: finalRisk.riskLevel,
+            riskReasons: finalRisk.riskReasons,
+            duplicateMatches,
+          }),
+        );
+        if (notificationWarning) notificationWarnings.push(notificationWarning);
 
         evidenceIds.push(evidence.id);
       }
 
+      const notificationWarning = notificationWarnings.join("\n") || undefined;
       await db.approvalAuditRun.update({
         where: { instanceCode },
-        data: { status: "SUCCESS", errorMessage: null },
+        data: {
+          status: notificationWarning ? "SUCCESS_WITH_WARNING" : "SUCCESS",
+          errorMessage: notificationWarning ?? null,
+        },
       });
 
-      return { skipped: false, evidenceIds };
+      return {
+        skipped: false,
+        evidenceIds,
+        ...(notificationWarning ? { warning: notificationWarning } : {}),
+      };
     } catch (error) {
       const errorMessage = toErrorMessage(error);
       const errorCode = error instanceof BusinessError ? error.errorCode : "AUDIT_FAILED";
@@ -165,14 +252,21 @@ export class ApprovalAuditService {
         data: { status, errorMessage },
       });
 
-      await this.deps.notifyService.sendManualReviewWarning({
-        instanceCode,
-        errorCode,
-        message: errorMessage,
-      });
+      const notificationWarning = await notifyBestEffort(() =>
+        this.deps.notifyService.sendManualReviewWarning({
+          serialNumber: approval?.serialNumber,
+          instanceCode,
+          errorCode,
+          message: errorMessage,
+        }),
+      );
 
       if (error instanceof BusinessError) {
-        return { skipped: false, evidenceIds: [], warning: errorMessage };
+        return {
+          skipped: false,
+          evidenceIds: [],
+          warning: [errorMessage, notificationWarning].filter(Boolean).join("\n"),
+        };
       }
       throw error;
     }
@@ -238,3 +332,18 @@ const parseDate = (value?: string): Date | null => {
   const date = new Date(normalized);
   return Number.isNaN(date.getTime()) ? null : date;
 };
+
+const notifyBestEffort = async (send: () => Promise<void>): Promise<string | undefined> => {
+  try {
+    await send();
+    return undefined;
+  } catch (error) {
+    return `Notification failed: ${toErrorMessage(error)}`;
+  }
+};
+
+const isUniqueConstraintError = (error: unknown): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === "P2002";

@@ -54,11 +54,16 @@ export class AIVisionOCRProvider implements OCRProvider {
       throw new AppError("AI_VISION_API_KEY is not configured", "AI_VISION_CONFIG_MISSING");
     }
 
-    if (!isSupportedImage(input.fileName, input.mimeType)) {
+    if (input.fileBuffer.length === 0) {
+      return { rawText: "", confidence: 0 };
+    }
+
+    const mimeType = input.mimeType || detectMimeType(input.fileName, input.fileBuffer);
+    if (!isSupportedVisionFile(input.fileName, mimeType)) {
       return extractPaymentFieldsFromTextFallback(input);
     }
 
-    const dataUrl = toDataUrl(input.fileBuffer, input.mimeType);
+    const dataUrl = toDataUrl(input.fileBuffer, mimeType);
     const response = await retry(
       () => this.http.post<VisionModelResponse>(requestPath(this.config), requestBody(this.config, dataUrl)),
       { attempts: 2, delayMs: 800 },
@@ -118,8 +123,14 @@ export const extractResponseText = (response: VisionModelResponse): string => {
   throw new AppError("AI OCR response did not contain text output", "AI_OCR_EMPTY_RESPONSE", 502);
 };
 
-const requestPath = (config: AppEnv): string =>
-  config.AI_VISION_API_STYLE === "chat_completions" ? "/v1/chat/completions" : "/v1/responses";
+const requestPath = (config: AppEnv): string => {
+  if (config.AI_VISION_API_STYLE === "chat_completions") {
+    return config.AI_VISION_BASE_URL.includes("/v4") || config.AI_VISION_BASE_URL.includes("/v1")
+      ? "/chat/completions"
+      : "/v1/chat/completions";
+  }
+  return config.AI_VISION_BASE_URL.includes("/v1") ? "/responses" : "/v1/responses";
+};
 
 const requestBody = (config: AppEnv, dataUrl: string): unknown => {
   if (config.AI_VISION_API_STYLE === "chat_completions") {
@@ -163,7 +174,7 @@ const requestBody = (config: AppEnv, dataUrl: string): unknown => {
 
 const ocrPrompt = [
   "你是企业报销付款凭证审核助手。",
-  "请只根据图片中可见内容提取字段，不要猜测、不要补全。",
+  "请只根据文件/图片中可见内容提取字段，不要猜测、不要补全。",
   "只输出 JSON，不要 Markdown。",
   "JSON 字段：rawText, amount, transactionId, paidAt, payee, confidence。",
   "amount 使用数字字符串，保留两位小数；paidAt 尽量使用 YYYY-MM-DD HH:mm:ss；无法识别的字段返回 null。",
@@ -199,12 +210,26 @@ const toDataUrl = (buffer: Buffer, mimeType?: string): string =>
   `data:${normalizeImageMimeType(mimeType)};base64,${buffer.toString("base64")}`;
 
 const normalizeImageMimeType = (mimeType?: string): string => {
-  if (mimeType?.startsWith("image/")) return mimeType;
+  if (mimeType?.startsWith("image/") || mimeType === "application/pdf") return mimeType;
   return "image/png";
 };
 
-const isSupportedImage = (fileName: string, mimeType?: string): boolean => {
+const detectMimeType = (fileName: string, buffer: Buffer): string => {
+  if (buffer[0] === 0x25 && buffer[1] === 0x50) return "application/pdf";
+  if (buffer[0] === 0x89 && buffer[1] === 0x50) return "image/png";
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return "image/jpeg";
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[8] === 0x57) return "image/webp";
+  if (buffer[0] === 0x47 && buffer[1] === 0x49) return "image/gif";
+  if (buffer[0] === 0x42 && buffer[1] === 0x4d) return "image/bmp";
+  if (/\.pdf$/i.test(fileName)) return "application/pdf";
+  if (/\.png$/i.test(fileName)) return "image/png";
+  if (/\.jpe?g$/i.test(fileName)) return "image/jpeg";
+  return "application/octet-stream";
+};
+
+const isSupportedVisionFile = (fileName: string, mimeType?: string): boolean => {
   if (mimeType?.startsWith("image/")) return true;
+  if (mimeType === "application/pdf") return true;
   return /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(fileName);
 };
 

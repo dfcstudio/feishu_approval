@@ -82,21 +82,49 @@ export class FeishuClient {
     return {
       instanceCode:
         firstString(instance, ["instance_code", "instanceCode", "code"]) ?? instanceCode,
+      serialNumber: firstString(instance, ["serial_number", "serialNumber", "serial_id"]),
       approvalName: firstString(instance, ["approval_name", "approvalName", "name", "title"]),
       applicantId: firstString(instance, ["user_id", "applicant_id", "applicantId", "open_id"]),
-      applicantName: firstString(instance, ["user_name", "applicant_name", "applicantName"]),
+      applicantName:
+        firstString(instance, ["user_name", "applicant_name", "applicantName"]) ??
+        firstString(instance, ["user_id", "applicant_id", "applicantId"]),
       form: instance.form ?? instance.form_value ?? instance.formValue ?? [],
       raw: instance,
     };
   }
 
   async downloadApprovalFile(attachment: NormalizedAttachment): Promise<Buffer> {
+    const fileToken = attachment.fileToken;
+
+    if (/^https?:\/\//i.test(fileToken)) {
+      const fileUrl = validateDirectFileDownloadUrl(fileToken, this.config);
+      const response = await retry(
+        () =>
+          this.http.get<ArrayBuffer>(fileUrl.toString(), {
+            responseType: "arraybuffer",
+            timeout: 30000,
+            maxContentLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
+            maxBodyLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
+          }),
+        { attempts: 2, delayMs: 500 },
+      );
+      assertDownloadSize(response.headers as Record<string, unknown>, this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES);
+      const buffer = Buffer.from(response.data);
+      if (buffer.byteLength > this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES) {
+        throw new AppError("Feishu approval attachment is too large", "FEISHU_FILE_TOO_LARGE", 413, {
+          maxBytes: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
+          actualBytes: buffer.byteLength,
+        });
+      }
+      return buffer;
+    }
+
     const token = await this.getTenantAccessToken();
-    const fileToken = encodeURIComponent(attachment.fileToken);
+    const encodedFileToken = encodeURIComponent(fileToken);
 
     const candidates = [
-      `/open-apis/approval/v4/files/${fileToken}/download`,
-      `/open-apis/drive/v1/medias/${fileToken}/download`,
+      `/open-apis/approval/v4/files/${encodedFileToken}/download`,
+      `/open-apis/drive/v1/medias/${encodedFileToken}/download`,
     ];
 
     let lastError: unknown;
@@ -151,12 +179,99 @@ export class FeishuClient {
       });
     }
   }
+
+  async sendInteractiveCard(input: {
+    receiveIdType: "open_id" | "user_id" | "chat_id";
+    receiveId: string;
+    card: Record<string, unknown>;
+  }): Promise<void> {
+    if (!input.receiveId) return;
+    const token = await this.getTenantAccessToken();
+    const response = await retry(
+      () =>
+        this.http.post(
+          `/open-apis/im/v1/messages?receive_id_type=${input.receiveIdType}`,
+          {
+            receive_id: input.receiveId,
+            msg_type: "interactive",
+            content: JSON.stringify(input.card),
+          },
+          { headers: { Authorization: `Bearer ${token}` } },
+        ),
+      { attempts: 3, delayMs: 500 },
+    );
+
+    const data = response.data as UnknownRecord;
+    if (data.code !== 0) {
+      throw new AppError("Failed to send Feishu interactive card", "FEISHU_MESSAGE_SEND_FAILED", 502, {
+        code: data.code,
+        msg: data.msg,
+      });
+    }
+  }
 }
 
 const firstString = (record: UnknownRecord, keys: string[]): string | undefined => {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) return value;
+    if (typeof value === "number") return String(value);
   }
   return undefined;
+};
+
+export const validateDirectFileDownloadUrl = (
+  rawUrl: string,
+  config: Pick<AppEnv, "FEISHU_API_BASE_URL" | "FEISHU_FILE_DOWNLOAD_ALLOWED_HOSTS">,
+): URL => {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new AppError("Invalid Feishu approval attachment URL", "FEISHU_FILE_DOWNLOAD_URL_INVALID", 400);
+  }
+
+  if (url.protocol !== "https:" || url.username || url.password) {
+    throw new AppError("Forbidden Feishu approval attachment URL", "FEISHU_FILE_DOWNLOAD_URL_FORBIDDEN", 400, {
+      protocol: url.protocol,
+      host: url.hostname,
+    });
+  }
+
+  const apiHost = new URL(config.FEISHU_API_BASE_URL).hostname;
+  const allowedHosts = [...config.FEISHU_FILE_DOWNLOAD_ALLOWED_HOSTS, apiHost];
+  if (!isAllowedDownloadHost(url.hostname, allowedHosts)) {
+    throw new AppError("Forbidden Feishu approval attachment host", "FEISHU_FILE_DOWNLOAD_HOST_FORBIDDEN", 403, {
+      host: url.hostname,
+    });
+  }
+
+  return url;
+};
+
+export const isAllowedDownloadHost = (hostname: string, allowedHosts: string[]): boolean => {
+  const host = normalizeHost(hostname);
+  return allowedHosts.some((allowedHost) => {
+    const pattern = normalizeHost(allowedHost);
+    if (!pattern) return false;
+    if (pattern.startsWith("*.")) {
+      const suffix = pattern.slice(2);
+      return host !== suffix && host.endsWith(`.${suffix}`);
+    }
+    return host === pattern;
+  });
+};
+
+const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/\.$/, "");
+
+const assertDownloadSize = (headers: Record<string, unknown>, maxBytes: number): void => {
+  const value = headers["content-length"];
+  const contentLength = Array.isArray(value) ? value[0] : value;
+  const size = typeof contentLength === "string" ? Number(contentLength) : undefined;
+  if (size !== undefined && Number.isFinite(size) && size > maxBytes) {
+    throw new AppError("Feishu approval attachment is too large", "FEISHU_FILE_TOO_LARGE", 413, {
+      maxBytes,
+      contentLength: size,
+    });
+  }
 };

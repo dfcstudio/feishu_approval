@@ -79,9 +79,9 @@ export const extractApprovalEvent = (
 };
 
 export const shouldAuditApprovalStatus = (status?: string): boolean => {
-  if (!status) return true;
+  if (!status) return false;
   const normalized = status.toUpperCase();
-  return ["PENDING", "START", "RUNNING", "PROCESSING", "ACTIVE"].includes(normalized);
+  return normalized === "PENDING" || normalized === "APPROVED";
 };
 
 const findFirstString = (record: UnknownRecord, keys: string[]): string | undefined => {

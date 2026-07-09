@@ -15,7 +15,7 @@ export const normalizeMoney = (input: unknown): string => {
     throw new BusinessError(`Cannot parse money value: ${String(input)}`, "MONEY_PARSE_FAILED");
   }
 
-  return centsToDecimal(decimalToCents(match[0]));
+  return centsToDecimal(Math.abs(decimalToCents(match[0])));
 };
 
 export const decimalToCents = (value: string): number => {
