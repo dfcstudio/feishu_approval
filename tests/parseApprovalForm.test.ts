@@ -7,6 +7,7 @@ describe("parseApprovalForm", () => {
       {
         instanceCode: "inst_1",
         serialNumber: "SN001",
+        approvalCode: "approval_1",
         approvalName: "差旅报销",
         form: JSON.stringify([
           { name: "报销金额", value: "99.90" },
@@ -23,6 +24,7 @@ describe("parseApprovalForm", () => {
     );
 
     expect(parsed.serialNumber).toBe("SN001");
+    expect(parsed.approvalCode).toBe("approval_1");
     expect(parsed.approvalAmount).toBe("99.90");
     expect(parsed.applicantId).toBe("u_1");
     expect(parsed.applicantName).toBe("张三");

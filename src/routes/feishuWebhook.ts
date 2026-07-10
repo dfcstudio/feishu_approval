@@ -13,7 +13,7 @@ import {
 } from "../services/feishu/verifyFeishuEvent.js";
 
 export interface AuditServiceLike {
-  audit(instanceCode: string, saveFiles: boolean): Promise<unknown>;
+  audit(instanceCode: string, saveFiles: boolean, status?: string): Promise<unknown>;
 }
 
 export interface FeishuWebhookDeps {
@@ -55,7 +55,7 @@ export const handleFeishuApprovalWebhook = async (
     }
 
     const saveFiles = event.status?.toUpperCase() === "APPROVED";
-    const result = await deps.auditService.audit(event.instanceCode, saveFiles);
+    const result = await deps.auditService.audit(event.instanceCode, saveFiles, event.status);
     return { status: 200, body: { ok: true, result } };
   } catch (error) {
     if (error instanceof AppError && error.statusCode === 401) {

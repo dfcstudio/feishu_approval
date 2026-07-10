@@ -87,7 +87,7 @@ describe("Feishu webhook", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(auditService.audit).toHaveBeenCalledWith("inst_pending", false);
+    expect(auditService.audit).toHaveBeenCalledWith("inst_pending", false, "PENDING");
   });
 
   it("audits approved approvals with original file saving enabled", async () => {
@@ -106,6 +106,6 @@ describe("Feishu webhook", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(auditService.audit).toHaveBeenCalledWith("inst_approved", true);
+    expect(auditService.audit).toHaveBeenCalledWith("inst_approved", true, "APPROVED");
   });
 });

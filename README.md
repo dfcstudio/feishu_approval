@@ -45,6 +45,8 @@ POST /webhooks/feishu/approval
 | `FEISHU_ENCRYPT_KEY` | 事件加密密钥；MVP 已预留入口，尚未实现解密 |
 | `FEISHU_NOTIFY_RECEIVE_ID_TYPE` | `open_id`、`user_id` 或 `chat_id` |
 | `FEISHU_NOTIFY_RECEIVE_ID` | 机器人消息接收人或群 ID |
+| `FEISHU_APPROVAL_DETAIL_URL_TEMPLATE` | 通知卡片“查看审批详情”链接模板；支持 `{instanceCode}` 占位符 |
+| `APPLICANT_NAME_MAP` | 报销人 ID 到姓名的临时映射，格式：`42cg4661:张三,9fc48b7a:李四` |
 | `APPROVAL_AMOUNT_FIELD_NAMES` | 金额字段候选名称，逗号分隔 |
 | `APPROVAL_ATTACHMENT_FIELD_NAMES` | 凭证/截图字段候选名称，逗号分隔 |
 | `APPROVAL_APPLICANT_FIELD_NAMES` | 申请人/报销人字段候选名称，逗号分隔 |
@@ -64,6 +66,43 @@ POST /webhooks/feishu/approval
 7. 将事件订阅里的 verification token 写入 `.env`。
 
 `FeishuClient` 已集中封装 tenant access token、审批实例读取、附件下载和机器人消息发送。不同审批控件返回的附件结构可能不同，真实上线前需要用实际审批实例 payload 校准 `parseApprovalForm.ts` 中的附件适配逻辑。
+
+### 常见故障处理
+
+如果订阅审批定义或读取审批实例时返回 `60002 unknown approval with code`，通常不是代码问题，而是当前应用对这些审批定义没有有效授权。特别是在新增 `contact:user.base:readonly` 等权限并重新发布应用后，需要在飞书开放平台重新安装/授权应用，再回到审批应用里确认事件订阅仍绑定到目标审批定义。
+
+当前审批定义码：
+
+```text
+BA2807BA-3FEC-4160-BAF8-F0F0FE91E109  采购报销（有票）
+720BFDB8-57D8-4808-AFC5-5312063D903A  采购报销（无票）
+CB1E3C0E-073F-4C01-A6D1-6EBF27207BBB  费用报销（有票）
+670EBDCD-1059-461E-AA29-6D13914A1971  费用报销（无票）
+```
+
+排查顺序：
+
+1. 飞书开放平台确认应用已发布最新版本，并已重新安装/授权到当前企业。
+2. 确认权限包含审批实例读取、审批文件读取、发送机器人消息、`contact:user.base:readonly`。
+3. 重新保存事件订阅 URL：`https://你的域名/webhooks/feishu/approval`，并用飞书的 URL 校验确认能返回 challenge。
+4. 在审批后台重新选择并保存上述 4 个审批定义的实例状态变更事件。
+5. 重新提交一张测试审批，检查服务日志是否收到 webhook。
+
+报销人仍显示 ID 时，可以先在 `.env` 配置：
+
+```env
+APPLICANT_NAME_MAP=42cg4661:张三,9fc48b7a:李四
+```
+
+重新授权后，服务会优先尝试通过通讯录基础信息接口解析姓名，失败时自动回退到这个映射，不会影响 OCR 和查重。
+
+“查看审批详情”按钮不能直接用 `go.feishu.cn/approval/s/.../` 分享短链，因为短链无法由 `instance_code` 本地推导。默认使用飞书官方审批 AppLink 协议，也可以通过环境变量覆盖：
+
+```env
+FEISHU_APPROVAL_DETAIL_URL_TEMPLATE=https://applink.feishu.cn/client/mini_program/open?mode=appCenter&appId=cli_9cb844403dbb9108&path=pc%2Fpages%2Fin-process%2Findex%3FinstanceId%3D{instanceCode}
+```
+
+如果模板包含 `{instanceCode}`，服务会替换该占位符；否则会自动追加 `instance_code=xxx` 查询参数。飞书品牌审批应用的固定 App ID 为 `cli_9cb844403dbb9108`。
 
 ## 审批字段映射
 

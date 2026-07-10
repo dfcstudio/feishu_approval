@@ -34,6 +34,18 @@ describe("OCR fallback extraction", () => {
     expect(result.confidence).toBe(0.82);
   });
 
+  it("removes labels from the recognized payee", () => {
+    const result = normalizeOcrJson(JSON.stringify({
+      rawText: "",
+      amount: "20.00",
+      payee: "商户全称：测试科技有限公司",
+      confidence: "0.9",
+    }));
+
+    expect(result.payee).toBe("测试科技有限公司");
+    expect(result.confidence).toBe(0.9);
+  });
+
   it("extracts text from chat completions style AI responses", () => {
     const text = extractResponseText({
       choices: [

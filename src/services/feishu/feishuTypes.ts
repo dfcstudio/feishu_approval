@@ -17,6 +17,7 @@ export interface NormalizedAttachment {
 export interface ParsedApprovalForm {
   instanceCode: string;
   serialNumber?: string;
+  approvalCode?: string;
   approvalName?: string | null;
   applicantId?: string | null;
   applicantName?: string | null;
@@ -27,9 +28,12 @@ export interface ParsedApprovalForm {
 export interface FeishuApprovalInstanceDetail {
   instanceCode: string;
   serialNumber?: string;
+  approvalCode?: string;
   approvalName?: string | null;
   applicantId?: string | null;
   applicantName?: string | null;
+  submitterOpenId?: string;
+  approverOpenIds?: string[];
   form: unknown;
   raw: unknown;
 }

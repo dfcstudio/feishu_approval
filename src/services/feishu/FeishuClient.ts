@@ -78,19 +78,62 @@ export class FeishuClient {
     const instance = ((data.data as UnknownRecord | undefined)?.instance ??
       data.data ??
       data) as UnknownRecord;
+    const applicantId = firstString(instance, ["user_id", "applicant_id", "applicantId", "open_id"]);
+    const taskList = instance.task_list ?? instance.taskList;
+    const approverOpenIds = Array.isArray(taskList)
+      ? [...new Set(taskList.flatMap((task) => {
+          if (!task || typeof task !== "object") return [];
+          const openId = firstString(task as UnknownRecord, ["open_id", "openId"]);
+          return openId ? [openId] : [];
+        }))]
+      : [];
 
     return {
       instanceCode:
         firstString(instance, ["instance_code", "instanceCode", "code"]) ?? instanceCode,
       serialNumber: firstString(instance, ["serial_number", "serialNumber", "serial_id"]),
+      approvalCode: firstString(instance, ["approval_code", "approvalCode"]),
       approvalName: firstString(instance, ["approval_name", "approvalName", "name", "title"]),
-      applicantId: firstString(instance, ["user_id", "applicant_id", "applicantId", "open_id"]),
+      applicantId,
       applicantName:
         firstString(instance, ["user_name", "applicant_name", "applicantName"]) ??
         firstString(instance, ["user_id", "applicant_id", "applicantId"]),
+      submitterOpenId:
+        firstString(instance, ["open_id", "openId"]) ??
+        (applicantId?.startsWith("ou_") ? applicantId : undefined),
+      approverOpenIds,
       form: instance.form ?? instance.form_value ?? instance.formValue ?? [],
       raw: instance,
     };
+  }
+
+  async resolveUserName(userId: string): Promise<string | undefined> {
+    const mappedName = this.config.APPLICANT_NAME_MAP[userId];
+    if (mappedName) return mappedName;
+
+    const token = await this.getTenantAccessToken();
+    const idTypes = ["open_id", "user_id"] as const;
+    for (const userIdType of idTypes) {
+      try {
+        const response = await retry(
+          () =>
+            this.http.get(
+              `/open-apis/contact/v3/users/${encodeURIComponent(userId)}?user_id_type=${userIdType}`,
+              { headers: { Authorization: `Bearer ${token}` } },
+            ),
+          { attempts: 2, delayMs: 500 },
+        );
+        const data = response.data as UnknownRecord;
+        if (data.code !== 0) continue;
+        const user = ((data.data as UnknownRecord | undefined)?.user ?? data.data ?? data) as UnknownRecord;
+        const name = firstString(user, ["name", "cn_name", "en_name", "nickname", "display_name"]);
+        if (name) return name;
+      } catch {
+        // User lookup is a best-effort display enhancement. Approval audit must not fail on it.
+      }
+    }
+
+    return undefined;
   }
 
   async downloadApprovalFile(attachment: NormalizedAttachment): Promise<Buffer> {

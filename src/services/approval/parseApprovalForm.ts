@@ -46,6 +46,7 @@ export const parseApprovalForm = (
   return {
     instanceCode: detail.instanceCode,
     serialNumber: detail.serialNumber,
+    approvalCode: detail.approvalCode,
     approvalName: detail.approvalName,
     applicantId: applicant.id ?? detail.applicantId,
     applicantName: applicant.name ?? detail.applicantName,
@@ -82,7 +83,7 @@ const normalizeFieldNode = (node: unknown): FormField[] => {
     "customId",
   ]);
 
-  if (!name) return nestedFields;
+  if (!name) return [...nestedFields, ...valueRows];
 
   const value =
     parsed.value ??

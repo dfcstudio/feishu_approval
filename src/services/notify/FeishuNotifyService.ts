@@ -16,6 +16,7 @@ export interface AuditNotificationInput {
   riskLevel: string;
   riskReasons: string[];
   duplicateMatches: DuplicateMatchResult[];
+  extraRecipientOpenIds?: string[];
 }
 
 const RISK_CN: Record<string, string> = {
@@ -53,11 +54,14 @@ const riskEmoji = (level: string): string => {
 export class FeishuNotifyService {
   constructor(
     private readonly feishuClient: FeishuClient,
-    private readonly config: Pick<AppEnv, "FEISHU_NOTIFY_RECEIVE_ID_TYPE" | "FEISHU_NOTIFY_RECEIVE_ID">,
+    private readonly config: Pick<
+      AppEnv,
+      "FEISHU_NOTIFY_RECEIVE_ID_TYPE" | "FEISHU_NOTIFY_RECEIVE_ID" | "FEISHU_APPROVAL_DETAIL_URL_TEMPLATE"
+    >,
   ) {}
 
   async sendAuditResult(input: AuditNotificationInput): Promise<void> {
-    const approvalUrl = `https://www.feishu.cn/approval/detail/${encodeURIComponent(input.instanceCode)}`;
+    const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
     const elements: Record<string, unknown>[] = [
       {
         tag: "div",
@@ -101,7 +105,14 @@ export class FeishuNotifyService {
     ];
 
     if (input.duplicateMatches.length > 0) {
-      const duplicateLines = input.duplicateMatches.map((match) => {
+      const seenMatches = new Set<string>();
+      const uniqueMatches = input.duplicateMatches.filter((match) => {
+        const key = `${match.matchType}:${match.matchedEvidence.instanceCode}`;
+        if (seenMatches.has(key)) return false;
+        seenMatches.add(key);
+        return true;
+      });
+      const duplicateLines = uniqueMatches.slice(0, 3).map((match) => {
         const evidence = match.matchedEvidence;
         return [
           `**${match.matchType}** score: ${match.score.toFixed(2)}`,
@@ -111,6 +122,7 @@ export class FeishuNotifyService {
           `提交时间: ${formatValue(evidence.createdAt)}`,
         ].join(" / ");
       });
+      if (uniqueMatches.length > 3) duplicateLines.push(`...共 ${uniqueMatches.length} 条匹配`);
 
       elements.push(
         { tag: "hr" },
@@ -148,18 +160,28 @@ export class FeishuNotifyService {
       },
     );
 
+    const card = {
+      config: { wide_screen_mode: true },
+      header: {
+        title: { tag: "plain_text", content: `报销辅助审核 ${riskEmoji(input.riskLevel)}` },
+        template: RISK_COLORS[input.riskLevel] ?? "grey",
+      },
+      elements,
+    };
+
     await this.feishuClient.sendInteractiveCard({
       receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
       receiveId: this.config.FEISHU_NOTIFY_RECEIVE_ID,
-      card: {
-        config: { wide_screen_mode: true },
-        header: {
-          title: { tag: "plain_text", content: `报销辅助审核 ${riskEmoji(input.riskLevel)}` },
-          template: RISK_COLORS[input.riskLevel] ?? "grey",
-        },
-        elements,
-      },
+      card,
     });
+
+    const recipients = [...new Set(input.extraRecipientOpenIds ?? [])]
+      .filter((receiveId) => receiveId && receiveId !== this.config.FEISHU_NOTIFY_RECEIVE_ID);
+    await Promise.allSettled(
+      recipients.map((receiveId) =>
+        this.feishuClient.sendInteractiveCard({ receiveIdType: "open_id", receiveId, card }),
+      ),
+    );
   }
 
   async sendManualReviewWarning(input: {
@@ -168,7 +190,7 @@ export class FeishuNotifyService {
     errorCode: string;
     message: string;
   }): Promise<void> {
-    const approvalUrl = `https://www.feishu.cn/approval/detail/${encodeURIComponent(input.instanceCode)}`;
+    const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
 
     await this.feishuClient.sendInteractiveCard({
       receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
@@ -223,7 +245,7 @@ export class FeishuNotifyService {
     fileName: string;
     storageKey?: string | null;
   }): Promise<void> {
-    const approvalUrl = `https://www.feishu.cn/approval/detail/${encodeURIComponent(input.instanceCode)}`;
+    const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
 
     await this.feishuClient.sendInteractiveCard({
       receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
@@ -272,6 +294,25 @@ const formatAmountMatched = (value: boolean | null): string => {
 
 const formatValue = (value: unknown): string => {
   if (!value) return "未识别";
-  if (value instanceof Date) return value.toISOString();
+  if (value instanceof Date) return formatLocalDate(value);
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) return formatLocalDate(parsed);
+  }
   return String(value);
 };
+
+const formatLocalDate = (value: Date): string => {
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  return [
+    `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`,
+    `${pad(value.getHours())}:${pad(value.getMinutes())}:${pad(value.getSeconds())}`,
+  ].join(" ");
+};
+
+export const buildApprovalDetailUrl = (instanceCode: string, template: string): string =>
+  template.includes("{instanceCode}")
+    ? template.replaceAll("{instanceCode}", encodeURIComponent(instanceCode))
+    : template.endsWith("=") || template.endsWith("/")
+      ? `${template}${encodeURIComponent(instanceCode)}`
+      : `${template}${template.includes("?") ? "&" : "?"}instance_code=${encodeURIComponent(instanceCode)}`;

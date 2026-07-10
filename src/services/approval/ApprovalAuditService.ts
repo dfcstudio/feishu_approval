@@ -14,6 +14,13 @@ import type { StorageProvider } from "../storage/StorageProvider.js";
 import type { FeishuNotifyService } from "../notify/FeishuNotifyService.js";
 import { parseApprovalForm } from "./parseApprovalForm.js";
 
+const APPROVAL_NAME_MAP: Record<string, string> = {
+  "BA2807BA-3FEC-4160-BAF8-F0F0FE91E109": "采购报销（有票）",
+  "720BFDB8-57D8-4808-AFC5-5312063D903A": "采购报销（无票）",
+  "CB1E3C0E-073F-4C01-A6D1-6EBF27207BBB": "费用报销（有票）",
+  "670EBDCD-1059-461E-AA29-6D13914A1971": "费用报销（无票）",
+};
+
 export interface ApprovalAuditResult {
   skipped: boolean;
   evidenceIds: string[];
@@ -40,9 +47,53 @@ export class ApprovalAuditService {
     },
   ) {}
 
-  async audit(instanceCode: string, saveFiles = true): Promise<ApprovalAuditResult> {
+  async audit(instanceCode: string, saveFiles = true, status?: string): Promise<ApprovalAuditResult> {
     const db = this.deps.db ?? prisma;
     const config = this.deps.config ?? env;
+
+    if (status?.toUpperCase() === "APPROVED") {
+      const cachedEvidence = await db.paymentEvidence.findFirst({
+        where: { instanceCode },
+        orderBy: { createdAt: "desc" },
+      });
+      if (cachedEvidence) {
+        let detail: Awaited<ReturnType<FeishuClient["getApprovalInstanceDetail"]>> | undefined;
+        try {
+          detail = await this.deps.feishuClient.getApprovalInstanceDetail(instanceCode);
+        } catch {
+          // Cached notification can still be sent while Feishu detail lookup is temporarily unavailable.
+        }
+        const notificationWarning = await notifyBestEffort(() =>
+          this.deps.notifyService.sendAuditResult({
+            serialNumber: detail?.serialNumber,
+            instanceCode,
+            approvalName:
+              cachedEvidence.approvalName ??
+              (detail?.approvalCode ? APPROVAL_NAME_MAP[detail.approvalCode] : undefined) ??
+              detail?.approvalName,
+            applicantName: cachedEvidence.applicantName ?? detail?.applicantName,
+            approvalAmount: cachedEvidence.approvalAmount.toString(),
+            ocrAmount: cachedEvidence.ocrAmount?.toString(),
+            amountMatched: cachedEvidence.amountMatched,
+            transactionId: cachedEvidence.transactionId,
+            paidAt: cachedEvidence.paidAt,
+            payee: cachedEvidence.payee,
+            riskLevel: cachedEvidence.riskLevel,
+            riskReasons: Array.isArray(cachedEvidence.riskReasons)
+              ? cachedEvidence.riskReasons.filter((reason): reason is string => typeof reason === "string")
+              : [],
+            duplicateMatches: [],
+            extraRecipientOpenIds: recipientOpenIds(detail),
+          }),
+        );
+        return {
+          skipped: true,
+          evidenceIds: [cachedEvidence.id],
+          ...(notificationWarning ? { warning: notificationWarning } : {}),
+        };
+      }
+    }
+
     const existing = await db.approvalAuditRun.findUnique({ where: { instanceCode } });
     if (!saveFiles && (existing?.status === "SUCCESS" || existing?.status === "SUCCESS_WITH_WARNING")) {
       return { skipped: true, evidenceIds: [] };
@@ -58,6 +109,11 @@ export class ApprovalAuditService {
     try {
       const detail = await this.deps.feishuClient.getApprovalInstanceDetail(instanceCode);
       approval = parseApprovalForm(detail, config);
+      approval = await resolveApplicantName(this.deps.feishuClient, approval, config.APPLICANT_NAME_MAP);
+      const approvalName =
+        approval.approvalName ??
+        (approval.approvalCode ? APPROVAL_NAME_MAP[approval.approvalCode] : undefined) ??
+        detail.approvalName;
       const evidenceIds: string[] = [];
       const notificationWarnings: string[] = [];
 
@@ -131,7 +187,7 @@ export class ApprovalAuditService {
               instanceCode: approval.instanceCode,
               applicantId: approval.applicantId,
               applicantName: approval.applicantName,
-              approvalName: approval.approvalName,
+              approvalName,
               approvalAmount: approval.approvalAmount,
               ocrAmount: ocr.amount,
               amountMatched,
@@ -209,7 +265,7 @@ export class ApprovalAuditService {
         const notificationWarning = await notifyBestEffort(() =>
           this.deps.notifyService.sendAuditResult({
             serialNumber: approval?.serialNumber,
-            approvalName: approval?.approvalName,
+            approvalName,
             instanceCode: approval?.instanceCode ?? instanceCode,
             applicantName: approval?.applicantName,
             approvalAmount: approval?.approvalAmount ?? "0.00",
@@ -221,6 +277,7 @@ export class ApprovalAuditService {
             riskLevel: finalRisk.riskLevel,
             riskReasons: finalRisk.riskReasons,
             duplicateMatches,
+            extraRecipientOpenIds: recipientOpenIds(detail),
           }),
         );
         if (notificationWarning) notificationWarnings.push(notificationWarning);
@@ -340,6 +397,31 @@ const notifyBestEffort = async (send: () => Promise<void>): Promise<string | und
   } catch (error) {
     return `Notification failed: ${toErrorMessage(error)}`;
   }
+};
+
+const recipientOpenIds = (
+  detail?: Awaited<ReturnType<FeishuClient["getApprovalInstanceDetail"]>>,
+): string[] => [
+  ...(detail?.submitterOpenId ? [detail.submitterOpenId] : []),
+  ...(detail?.approverOpenIds ?? []),
+];
+
+const resolveApplicantName = async (
+  feishuClient: FeishuClient,
+  approval: ParsedApprovalForm,
+  applicantNameMap: AppEnv["APPLICANT_NAME_MAP"],
+): Promise<ParsedApprovalForm> => {
+  const applicantId = approval.applicantId?.trim();
+  const currentName = approval.applicantName?.trim();
+  if (!applicantId || (currentName && currentName !== applicantId)) return approval;
+
+  const mappedName = applicantNameMap[applicantId];
+  if (mappedName) return { ...approval, applicantName: mappedName };
+
+  const resolvedName = await feishuClient.resolveUserName(applicantId);
+  if (resolvedName) return { ...approval, applicantName: resolvedName };
+
+  return approval;
 };
 
 const isUniqueConstraintError = (error: unknown): boolean =>

@@ -1,4 +1,9 @@
 import axios, { type AxiosInstance } from "axios";
+import { execFile } from "node:child_process";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { z } from "zod";
 import type { AppEnv } from "../../config/env.js";
 import { AppError } from "../../utils/errors.js";
@@ -31,6 +36,8 @@ type VisionModelResponse = {
   }>;
 };
 
+const execFileAsync = promisify(execFile);
+
 export class AIVisionOCRProvider implements OCRProvider {
   private readonly http: AxiosInstance;
 
@@ -58,12 +65,18 @@ export class AIVisionOCRProvider implements OCRProvider {
       return { rawText: "", confidence: 0 };
     }
 
-    const mimeType = input.mimeType || detectMimeType(input.fileName, input.fileBuffer);
+    const detectedMimeType = detectMimeType(input.fileName, input.fileBuffer);
+    const mimeType = input.mimeType && input.mimeType !== "application/octet-stream"
+      ? input.mimeType
+      : detectedMimeType;
     if (!isSupportedVisionFile(input.fileName, mimeType)) {
       return extractPaymentFieldsFromTextFallback(input);
     }
 
-    const dataUrl = toDataUrl(input.fileBuffer, mimeType);
+    const visionInput = mimeType === "application/pdf"
+      ? { buffer: await convertPdfToPng(input.fileBuffer), mimeType: "image/png" }
+      : { buffer: input.fileBuffer, mimeType };
+    const dataUrl = toDataUrl(visionInput.buffer, visionInput.mimeType);
     const response = await retry(
       () => this.http.post<VisionModelResponse>(requestPath(this.config), requestBody(this.config, dataUrl)),
       { attempts: 2, delayMs: 800 },
@@ -94,7 +107,7 @@ export const normalizeOcrJson = (text: string): PaymentOCRResult => {
     amount: amount ?? fallback?.amount,
     transactionId: cleanOptional(data.transactionId) ?? fallback?.transactionId,
     paidAt: cleanOptional(data.paidAt) ?? fallback?.paidAt,
-    payee: cleanOptional(data.payee) ?? fallback?.payee,
+    payee: cleanPayee(data.payee) ?? fallback?.payee,
     confidence: data.confidence,
   };
 };
@@ -173,11 +186,15 @@ const requestBody = (config: AppEnv, dataUrl: string): unknown => {
 };
 
 const ocrPrompt = [
-  "你是企业报销付款凭证审核助手。",
-  "请只根据文件/图片中可见内容提取字段，不要猜测、不要补全。",
+  "你是企业报销付款凭证审核助手，专门识别发票和付款截图。",
+  "请只根据文件或图片中可见内容提取字段，不要猜测、不要补全。",
   "只输出 JSON，不要 Markdown。",
   "JSON 字段：rawText, amount, transactionId, paidAt, payee, confidence。",
-  "amount 使用数字字符串，保留两位小数；paidAt 尽量使用 YYYY-MM-DD HH:mm:ss；无法识别的字段返回 null。",
+  "amount：发票取价税合计，付款截图取实际扣款金额；使用数字字符串并保留两位小数。",
+  "transactionId：提取发票号码、交易单号或商户单号。",
+  "paidAt：尽量使用 YYYY-MM-DD HH:mm:ss。",
+  "payee：提取销售方或收款商户全称，不要包含“名称”“商户全称”等字段前缀。",
+  "confidence：0 到 1 之间的数字；无法识别的字段返回 null。",
 ].join("\n");
 
 const extractJsonObject = (text: string): string => {
@@ -204,6 +221,33 @@ const safeNormalizeMoney = (value?: string | number | null): string | undefined 
 const cleanOptional = (value?: string | null): string | undefined => {
   const text = value?.trim();
   return text && text.toLowerCase() !== "null" ? text : undefined;
+};
+
+const cleanPayee = (value?: string | null): string | undefined => {
+  const text = cleanOptional(value);
+  if (!text) return undefined;
+  return text
+    .replace(/^(?:商户全称|全称|商户名称|商户|收款方|收款人|对方|销售方名称|名称)\s*[:：]?\s*/u, "")
+    .trim() || undefined;
+};
+
+const convertPdfToPng = async (pdfBuffer: Buffer): Promise<Buffer> => {
+  const directory = await mkdtemp(join(tmpdir(), "feishu-ocr-"));
+  const pdfPath = join(directory, "input.pdf");
+  const pngPath = join(directory, "output.png");
+  try {
+    await writeFile(pdfPath, pdfBuffer);
+    await execFileAsync("/usr/bin/sips", ["-s", "format", "png", pdfPath, "--out", pngPath], {
+      timeout: 15_000,
+    });
+    return await readFile(pngPath);
+  } catch (error) {
+    throw new AppError("Failed to convert PDF evidence to PNG", "PDF_CONVERSION_FAILED", 502, {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 };
 
 const toDataUrl = (buffer: Buffer, mimeType?: string): string =>

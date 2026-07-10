@@ -18,6 +18,24 @@ const csv = (fallback: string) =>
         .filter(Boolean),
     );
 
+const keyValueMap = z
+  .string()
+  .default("")
+  .transform((value) =>
+    Object.fromEntries(
+      value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => {
+          const separatorIndex = item.indexOf(":");
+          if (separatorIndex < 0) return [item, ""] as const;
+          return [item.slice(0, separatorIndex).trim(), item.slice(separatorIndex + 1).trim()] as const;
+        })
+        .filter(([key, mappedValue]) => key && mappedValue),
+    ),
+  );
+
 const fallbackEnv = (fallbackKey: string) =>
   z.preprocess((value) => {
     if (typeof value === "string" && value.trim()) return value;
@@ -53,6 +71,12 @@ const envSchema = z.object({
   FEISHU_FILE_DOWNLOAD_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   FEISHU_NOTIFY_RECEIVE_ID_TYPE: z.enum(["open_id", "user_id", "chat_id"]).default("chat_id"),
   FEISHU_NOTIFY_RECEIVE_ID: z.string().default(""),
+  FEISHU_APPROVAL_DETAIL_URL_TEMPLATE: z
+    .string()
+    .default(
+      "https://applink.feishu.cn/client/mini_program/open?mode=appCenter&appId=cli_9cb844403dbb9108&path=pc%2Fpages%2Fin-process%2Findex%3FinstanceId%3D{instanceCode}",
+    ),
+  APPLICANT_NAME_MAP: keyValueMap,
   OPENAI_API_KEY: z.string().default(""),
   OPENAI_BASE_URL: z.string().url().default("https://api.openai.com"),
   OPENAI_VISION_MODEL: z.string().default("gpt-4o-mini"),
