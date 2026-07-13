@@ -18,6 +18,23 @@ describe("OCR fallback extraction", () => {
     expect(result.confidence).toBeGreaterThan(0);
   });
 
+  it("extracts fields from GLM-OCR payment markdown", () => {
+    const result = extractPaymentFields([
+      "吾悦广场",
+      "-35.00",
+      "当前状态支付成功",
+      "支付时间 2026年6月9日 02:26:35",
+      "商户全称 新城吾悦商业管理集团有限公司上海分公司",
+      "交易单号 4200003089202606096187571133",
+      "商户单号 14BFP202606090226290379933665",
+    ].join("\n\n"));
+
+    expect(result.amount).toBe("35.00");
+    expect(result.transactionId).toBe("4200003089202606096187571133");
+    expect(result.paidAt).toBe("2026-6-9 02:26:35");
+    expect(result.payee).toBe("新城吾悦商业管理集团有限公司上海分公司");
+  });
+
   it("normalizes AI OCR JSON output", () => {
     const result = normalizeOcrJson(JSON.stringify({
       rawText: "支付金额：¥1,234.5\n交易号：TXN987654321",

@@ -4,7 +4,7 @@ import type { AppEnv } from "../config/env.js";
 import { AppError, toErrorMessage } from "../utils/errors.js";
 import type { ApprovalAuditService } from "../services/approval/ApprovalAuditService.js";
 import {
-  ensureNotEncrypted,
+  decryptFeishuPayload,
   extractApprovalEvent,
   isUrlVerification,
   parseFeishuWebhookPayload,
@@ -32,8 +32,7 @@ export const handleFeishuApprovalWebhook = async (
   deps: FeishuWebhookDeps,
 ): Promise<FeishuWebhookResponse> => {
   try {
-    const payload = parseFeishuWebhookPayload(body);
-    ensureNotEncrypted(payload, deps.config.FEISHU_ENCRYPT_KEY);
+    const payload = decryptFeishuPayload(parseFeishuWebhookPayload(body), deps.config.FEISHU_ENCRYPT_KEY);
     verifyEventToken(payload, deps.config.FEISHU_VERIFICATION_TOKEN);
 
     if (isUrlVerification(payload)) {

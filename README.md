@@ -50,6 +50,7 @@ POST /webhooks/feishu/approval
 | `APPROVAL_AMOUNT_FIELD_NAMES` | 金额字段候选名称，逗号分隔 |
 | `APPROVAL_ATTACHMENT_FIELD_NAMES` | 凭证/截图字段候选名称，逗号分隔 |
 | `APPROVAL_APPLICANT_FIELD_NAMES` | 申请人/报销人字段候选名称，逗号分隔 |
+| `APPROVAL_HANDLER_FIELD_NAMES` | 审批通过后接收结果的办理人人员控件名称，逗号分隔 |
 | `LOCAL_STORAGE_DIR` | 本地凭证保存目录；后续可替换为 S3 Provider |
 | `SAVE_ORIGINAL_FILE` | 是否保存原始付款凭证 |
 | `SAVE_OCR_RAW_TEXT` | 是否保存 OCR 原文 |
@@ -112,7 +113,10 @@ FEISHU_APPROVAL_DETAIL_URL_TEMPLATE=https://applink.feishu.cn/client/mini_progra
 APPROVAL_AMOUNT_FIELD_NAMES=报销金额,金额,实付金额
 APPROVAL_ATTACHMENT_FIELD_NAMES=付款凭证,支付截图,报销凭证,附件
 APPROVAL_APPLICANT_FIELD_NAMES=申请人,报销人
+APPROVAL_HANDLER_FIELD_NAMES=办理人,经办人,付款办理人
 ```
+
+提交时，审核结果会发送给提交人和当前待审批人；审批通过后，会发送给表单“办理人”人员控件中选择的人员。人员 ID 均从审批实例自动读取，无需逐个维护。固定财务人员或群仍由 `FEISHU_NOTIFY_RECEIVE_ID` 配置并作为兜底接收方。
 
 如果字段解析失败，系统会把 audit run 标记为 `SUCCESS_WITH_WARNING`，并向财务群发送“需要人工处理”的提示，避免飞书 webhook 反复重试。
 
@@ -168,6 +172,14 @@ AI_VISION_API_STYLE=chat_completions
 - 如果公司有数据合规要求，先确认付款截图、银行卡尾号、交易流水号是否允许发送到第三方模型服务。
 
 ## 查重规则
+
+同一审批内的付款凭证和发票会逐张 OCR、查重，并按类别分别汇总后与“费用明细汇总”核对，避免同一笔费用的付款截图和发票被相加两次。通知通过数据库 outbox 异步发送，并自动路由到固定财务目标、当前审批人、中高风险申请人，以及按规则配置的部门财务/风控负责人。
+
+通知规则可通过以下命令维护：
+
+```bash
+npm run db:studio
+```
 
 风险等级：
 

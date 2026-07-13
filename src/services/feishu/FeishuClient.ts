@@ -83,10 +83,16 @@ export class FeishuClient {
     const approverOpenIds = Array.isArray(taskList)
       ? [...new Set(taskList.flatMap((task) => {
           if (!task || typeof task !== "object") return [];
-          const openId = firstString(task as UnknownRecord, ["open_id", "openId"]);
+          const taskRecord = task as UnknownRecord;
+          const status = firstString(taskRecord, ["status", "task_status", "taskStatus"]);
+          if (!status || !["PENDING", "TODO", "WAITING"].includes(status.toUpperCase())) return [];
+          const openId = firstString(taskRecord, ["open_id", "openId"]);
           return openId ? [openId] : [];
         }))]
       : [];
+    const currentApprovers = extractCurrentApprovers(instance);
+    let applicantDepartmentIds = extractStringArray(instance, ["department_ids", "departmentIds", "department_id", "departmentId"]);
+    if (!applicantDepartmentIds.length && applicantId) applicantDepartmentIds = await this.getUserDepartmentIds(applicantId);
 
     return {
       instanceCode:
@@ -102,6 +108,8 @@ export class FeishuClient {
         firstString(instance, ["open_id", "openId"]) ??
         (applicantId?.startsWith("ou_") ? applicantId : undefined),
       approverOpenIds,
+      currentApprovers,
+      applicantDepartmentIds,
       form: instance.form ?? instance.form_value ?? instance.formValue ?? [],
       raw: instance,
     };
@@ -136,21 +144,47 @@ export class FeishuClient {
     return undefined;
   }
 
+  private async getUserDepartmentIds(userId: string): Promise<string[]> {
+    try {
+      const token = await this.getTenantAccessToken();
+      const userIdType = userId.startsWith("ou_") ? "open_id" : "user_id";
+      const response = await this.http.get(`/open-apis/contact/v3/users/${encodeURIComponent(userId)}`, {
+        params: { user_id_type: userIdType }, headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = response.data as UnknownRecord;
+      const user = ((data.data as UnknownRecord | undefined)?.user ?? data.data ?? {}) as UnknownRecord;
+      return extractStringArray(user, ["department_ids", "departmentIds"]);
+    } catch { return []; }
+  }
+
   async downloadApprovalFile(attachment: NormalizedAttachment): Promise<Buffer> {
     const fileToken = attachment.fileToken;
 
     if (/^https?:\/\//i.test(fileToken)) {
       const fileUrl = validateDirectFileDownloadUrl(fileToken, this.config);
-      const response = await retry(
-        () =>
-          this.http.get<ArrayBuffer>(fileUrl.toString(), {
-            responseType: "arraybuffer",
-            timeout: 30000,
-            maxContentLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
-            maxBodyLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
-          }),
-        { attempts: 2, delayMs: 500 },
-      );
+      let response;
+      try {
+        response = await retry(
+          () =>
+            this.http.get<ArrayBuffer>(fileUrl.toString(), {
+              responseType: "arraybuffer",
+              timeout: 30000,
+              maxContentLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
+              maxBodyLength: this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES,
+            }),
+          { attempts: 2, delayMs: 500 },
+        );
+      } catch (error) {
+        throw new AppError(
+          `Failed to download Feishu approval attachment from ${fileUrl.hostname}${httpStatusSuffix(error)}`,
+          "FEISHU_FILE_DOWNLOAD_FAILED",
+          502,
+          {
+            host: fileUrl.hostname,
+            upstreamStatus: axios.isAxiosError(error) ? error.response?.status : undefined,
+          },
+        );
+      }
       assertDownloadSize(response.headers as Record<string, unknown>, this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES);
       const buffer = Buffer.from(response.data);
       if (buffer.byteLength > this.config.FEISHU_FILE_DOWNLOAD_MAX_BYTES) {
@@ -263,6 +297,30 @@ const firstString = (record: UnknownRecord, keys: string[]): string | undefined 
   return undefined;
 };
 
+const extractStringArray = (record: UnknownRecord, keys: string[]): string[] => {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return [value];
+    if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string" && Boolean(item.trim()));
+  }
+  return [];
+};
+
+export const extractCurrentApprovers = (instance: UnknownRecord) => {
+  const tasks = instance.task_list ?? instance.taskList ?? instance.tasks ?? [];
+  if (!Array.isArray(tasks)) return [];
+  return tasks.flatMap((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const task = raw as UnknownRecord;
+    const status = firstString(task, ["status", "task_status", "taskStatus"])?.toUpperCase();
+    if (status && !["PENDING", "TODO", "WAITING", "RUNNING", "PROCESSING", "ACTIVE"].includes(status)) return [];
+    const openId = firstString(task, ["open_id", "openId", "approver_open_id", "approverOpenId"]);
+    const userId = firstString(task, ["user_id", "userId", "approver_id", "approverId"]);
+    if (!openId && !userId) return [];
+    return [{ openId, userId, name: firstString(task, ["user_name", "userName", "name", "approver_name"]) }];
+  });
+};
+
 export const validateDirectFileDownloadUrl = (
   rawUrl: string,
   config: Pick<AppEnv, "FEISHU_API_BASE_URL" | "FEISHU_FILE_DOWNLOAD_ALLOWED_HOSTS">,
@@ -284,9 +342,12 @@ export const validateDirectFileDownloadUrl = (
   const apiHost = new URL(config.FEISHU_API_BASE_URL).hostname;
   const allowedHosts = [...config.FEISHU_FILE_DOWNLOAD_ALLOWED_HOSTS, apiHost];
   if (!isAllowedDownloadHost(url.hostname, allowedHosts)) {
-    throw new AppError("Forbidden Feishu approval attachment host", "FEISHU_FILE_DOWNLOAD_HOST_FORBIDDEN", 403, {
-      host: url.hostname,
-    });
+    throw new AppError(
+      `Forbidden Feishu approval attachment host: ${url.hostname}`,
+      "FEISHU_FILE_DOWNLOAD_HOST_FORBIDDEN",
+      403,
+      { host: url.hostname },
+    );
   }
 
   return url;
@@ -306,6 +367,11 @@ export const isAllowedDownloadHost = (hostname: string, allowedHosts: string[]):
 };
 
 const normalizeHost = (host: string): string => host.trim().toLowerCase().replace(/\.$/, "");
+
+const httpStatusSuffix = (error: unknown): string => {
+  if (!axios.isAxiosError(error) || !error.response?.status) return "";
+  return ` (HTTP ${error.response.status})`;
+};
 
 const assertDownloadSize = (headers: Record<string, unknown>, maxBytes: number): void => {
   const value = headers["content-length"];

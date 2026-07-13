@@ -12,6 +12,7 @@ export interface NormalizedAttachment {
   mimeType?: string;
   size?: number;
   raw: unknown;
+  documentType: "PAYMENT" | "INVOICE";
 }
 
 export interface ParsedApprovalForm {
@@ -23,6 +24,9 @@ export interface ParsedApprovalForm {
   applicantName?: string | null;
   approvalAmount: string;
   attachments: NormalizedAttachment[];
+  handlerOpenIds: string[];
+  applicantDepartmentIds: string[];
+  currentApprovers: ApprovalApprover[];
 }
 
 export interface FeishuApprovalInstanceDetail {
@@ -34,6 +38,14 @@ export interface FeishuApprovalInstanceDetail {
   applicantName?: string | null;
   submitterOpenId?: string;
   approverOpenIds?: string[];
+  applicantDepartmentIds?: string[];
+  currentApprovers?: ApprovalApprover[];
   form: unknown;
   raw: unknown;
+}
+
+export interface ApprovalApprover {
+  openId?: string;
+  userId?: string;
+  name?: string;
 }

@@ -8,6 +8,7 @@ datasource db {
 }
 
 enum AuditRunStatus {
+  QUEUED
   PROCESSING
   SUCCESS
   SUCCESS_WITH_WARNING
@@ -29,49 +30,138 @@ enum DuplicateMatchType {
 }
 
 model ApprovalAuditRun {
-  id           String         @id @default(cuid())
-  instanceCode String         @unique
-  status       AuditRunStatus
-  errorMessage String?
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
+  id                 String         @id @default(cuid())
+  instanceCode       String         @unique
+  status             AuditRunStatus
+  errorMessage       String?
+  approvedNotifiedAt DateTime?
+  retryCount         Int            @default(0)
+  nextRetryAt        DateTime       @default(now())
+  leaseUntil         DateTime?
+  leaseOwner         String?
+  startedAt          DateTime?
+  finishedAt         DateTime?
+  requestedStatus    String?
+  saveFiles          Boolean        @default(true)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
+  @@index([status, nextRetryAt])
+  @@index([status, leaseUntil])
   @@map("approval_audit_runs")
 }
 
 model PaymentEvidence {
-  id             String           @id @default(cuid())
-  instanceCode   String
-  applicantId    String?
-  applicantName  String?
-  approvalName   String?
-  approvalAmount Decimal          @db.Decimal(18, 2)
-  ocrAmount      Decimal?         @db.Decimal(18, 2)
-  amountMatched  Boolean
-  transactionId  String?
-  paidAt         DateTime?
-  payee          String?
-  fileName       String
-  mimeType       String?
-  fileSize       Int?
-  storageKey     String?
-  sha256         String
-  perceptualHash String?
-  ocrRawText     String?
-  ocrConfidence  Float
-  riskLevel      RiskLevel
-  riskReasons    Json
-  createdAt      DateTime         @default(now())
+  id               String    @id @default(cuid())
+  instanceCode     String
+  fileToken        String?
+  documentType     String    @default("PAYMENT")
+  applicantId      String?
+  applicantName    String?
+  approvalName     String?
+  approvalAmount   Decimal   @db.Decimal(18, 2)
+  ocrAmount        Decimal?  @db.Decimal(18, 2)
+  amountMatched    Boolean
+  transactionId    String?
+  paidAt           DateTime?
+  payee            String?
+  fileName         String
+  mimeType         String?
+  fileSize         Int?
+  storageKey       String?
+  sha256           String
+  perceptualHash   String?
+  ocrRawText       String?
+  ocrConfidence    Float
+  riskLevel        RiskLevel
+  riskReasons      Json
+  processingStatus String    @default("COMPLETE")
+  createdAt        DateTime  @default(now())
 
   duplicateMatchesCurrent DuplicateMatch[] @relation("currentEvidence")
   duplicateMatchesMatched DuplicateMatch[] @relation("matchedEvidence")
 
   @@unique([instanceCode, sha256])
+  @@unique([instanceCode, fileToken])
   @@index([instanceCode])
   @@index([sha256])
   @@index([transactionId])
   @@index([approvalAmount, paidAt, payee])
   @@map("payment_evidences")
+}
+
+model ApprovalAuditSummary {
+  id                     String    @id @default(cuid())
+  instanceCode           String    @unique
+  expenseSummaryAmount   Decimal   @db.Decimal(18, 2)
+  paymentDocumentCount   Int       @default(0)
+  paymentRecognizedCount Int       @default(0)
+  paymentTotal           Decimal?  @db.Decimal(18, 2)
+  paymentTotalMatched    Boolean?
+  invoiceDocumentCount   Int       @default(0)
+  invoiceRecognizedCount Int       @default(0)
+  invoiceTotal           Decimal?  @db.Decimal(18, 2)
+  invoiceTotalMatched    Boolean?
+  riskLevel              RiskLevel
+  riskReasons            Json
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  @@map("approval_audit_summaries")
+}
+
+model NotificationOutbox {
+  id            String    @id @default(cuid())
+  kind          String
+  dedupeKey     String    @unique
+  recipientRole String?
+  receiveIdType String
+  receiveId     String
+  payload       Json
+  status        String    @default("PENDING")
+  retryCount    Int       @default(0)
+  nextRetryAt   DateTime  @default(now())
+  leaseUntil    DateTime?
+  lastError     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  sentAt        DateTime?
+
+  @@index([status, nextRetryAt])
+  @@map("notification_outbox")
+}
+
+model NotificationRule {
+  id                     String    @id @default(cuid())
+  name                   String
+  enabled                Boolean   @default(true)
+  departmentId           String?
+  minRiskLevel           RiskLevel @default(LOW)
+  recipientRole          String
+  receiveIdType          String?
+  receiveId              String?
+  notifyApplicant        Boolean   @default(false)
+  notifyCurrentApprovers Boolean   @default(false)
+  priority               Int       @default(0)
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  @@index([enabled, departmentId, minRiskLevel])
+  @@map("notification_rules")
+}
+
+model DepartmentNotificationOwner {
+  id            String   @id @default(cuid())
+  departmentId  String
+  role          String
+  receiveIdType String
+  receiveId     String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([departmentId, role, receiveIdType, receiveId])
+  @@index([departmentId, role])
+  @@map("department_notification_owners")
 }
 
 model DuplicateMatch {

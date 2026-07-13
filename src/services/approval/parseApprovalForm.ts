@@ -18,13 +18,19 @@ export const parseApprovalForm = (
   detail: FeishuApprovalInstanceDetail,
   config: Pick<
     AppEnv,
-    "APPROVAL_AMOUNT_FIELD_NAMES" | "APPROVAL_ATTACHMENT_FIELD_NAMES" | "APPROVAL_APPLICANT_FIELD_NAMES"
+    | "APPROVAL_AMOUNT_FIELD_NAMES"
+    | "APPROVAL_ATTACHMENT_FIELD_NAMES"
+    | "APPROVAL_INVOICE_FIELD_NAMES"
+    | "APPROVAL_APPLICANT_FIELD_NAMES"
+    | "APPROVAL_HANDLER_FIELD_NAMES"
   >,
 ): ParsedApprovalForm => {
   const fields = normalizeFormFields(detail.form);
   const amountField = findByNames(fields, config.APPROVAL_AMOUNT_FIELD_NAMES);
-  const attachmentField = findByNames(fields, config.APPROVAL_ATTACHMENT_FIELD_NAMES);
+  const paymentFields = findAllByNames(fields, config.APPROVAL_ATTACHMENT_FIELD_NAMES);
+  const invoiceFields = findAllByNames(fields, config.APPROVAL_INVOICE_FIELD_NAMES);
   const applicantField = findByNames(fields, config.APPROVAL_APPLICANT_FIELD_NAMES);
+  const handlerField = findByNames(fields, config.APPROVAL_HANDLER_FIELD_NAMES);
 
   if (!amountField) {
     throw new BusinessError("Cannot parse approval amount field", "APPROVAL_AMOUNT_FIELD_NOT_FOUND", {
@@ -33,7 +39,10 @@ export const parseApprovalForm = (
     });
   }
 
-  const attachments = attachmentField ? normalizeAttachments(attachmentField.value) : [];
+  const byToken = new Map<string, NormalizedAttachment>();
+  for (const field of paymentFields) for (const item of normalizeAttachments(field.value, "PAYMENT")) byToken.set(item.fileToken, item);
+  for (const field of invoiceFields) for (const item of normalizeAttachments(field.value, "INVOICE")) byToken.set(item.fileToken, item);
+  const attachments = [...byToken.values()];
   if (attachments.length === 0) {
     throw new BusinessError("Cannot parse payment evidence attachments", "APPROVAL_ATTACHMENT_FIELD_NOT_FOUND", {
       configuredNames: config.APPROVAL_ATTACHMENT_FIELD_NAMES,
@@ -50,9 +59,32 @@ export const parseApprovalForm = (
     approvalName: detail.approvalName,
     applicantId: applicant.id ?? detail.applicantId,
     applicantName: applicant.name ?? detail.applicantName,
-    approvalAmount: normalizeMoney(amountField.value),
+    approvalAmount: normalizeMoney(unwrapMoneyValue(amountField.value)),
     attachments,
+    handlerOpenIds: parsePersonOpenIds(handlerField?.value),
+    applicantDepartmentIds: detail.applicantDepartmentIds ?? [],
+    currentApprovers: detail.currentApprovers ?? [],
   };
+};
+
+const parsePersonOpenIds = (input: unknown): string[] => {
+  const openIds = new Set<string>();
+  const visit = (value: unknown): void => {
+    const parsed = parseMaybeJson(value);
+    if (Array.isArray(parsed)) {
+      parsed.forEach(visit);
+      return;
+    }
+    if (!isRecord(parsed)) return;
+
+    const openId = firstString(parsed, ["open_id", "openId"]);
+    if (openId) openIds.add(openId);
+    for (const key of ["value", "values", "user", "users", "member", "members"]) {
+      if (parsed[key] !== undefined) visit(parsed[key]);
+    }
+  };
+  visit(input);
+  return [...openIds];
 };
 
 export const normalizeFormFields = (input: unknown): FormField[] => {
@@ -96,16 +128,16 @@ const normalizeFieldNode = (node: unknown): FormField[] => {
   return [{ name, value: parseMaybeJson(value), raw: parsed }, ...nestedFields, ...valueRows];
 };
 
-const normalizeAttachments = (input: unknown): NormalizedAttachment[] => {
+const normalizeAttachments = (input: unknown, documentType: NormalizedAttachment["documentType"]): NormalizedAttachment[] => {
   const parsed = parseMaybeJson(input);
   const candidates = Array.isArray(parsed) ? parsed : [parsed];
-  return candidates.flatMap((candidate) => extractAttachmentCandidates(candidate));
+  return candidates.flatMap((candidate) => extractAttachmentCandidates(candidate, documentType));
 };
 
-const extractAttachmentCandidates = (input: unknown): NormalizedAttachment[] => {
+const extractAttachmentCandidates = (input: unknown, documentType: NormalizedAttachment["documentType"]): NormalizedAttachment[] => {
   const parsed = parseMaybeJson(input);
   if (typeof parsed === "string" && parsed.trim()) {
-    return [{ fileToken: parsed.trim(), name: undefined, mimeType: undefined, size: undefined, raw: parsed }];
+    return [{ fileToken: parsed.trim(), name: undefined, mimeType: undefined, size: undefined, raw: parsed, documentType }];
   }
   if (!isRecord(parsed)) return [];
 
@@ -140,11 +172,12 @@ const extractAttachmentCandidates = (input: unknown): NormalizedAttachment[] => 
           mimeType: firstString(parsed, ["mime_type", "mimeType", "type"]),
           size: firstNumber(parsed, ["size", "file_size", "fileSize"]),
           raw: parsed,
+          documentType,
         },
       ]
     : [];
 
-  return [...current, ...nested.flatMap((item) => extractAttachmentCandidates(item))];
+  return [...current, ...nested.flatMap((item) => extractAttachmentCandidates(item, documentType))];
 };
 
 const parseApplicant = (input: unknown): { id?: string; name?: string } => {
@@ -160,6 +193,20 @@ const parseApplicant = (input: unknown): { id?: string; name?: string } => {
 const findByNames = (fields: FormField[], names: string[]): FormField | undefined => {
   const normalizedNames = names.map((name) => name.trim().toLowerCase());
   return fields.find((field) => normalizedNames.includes(field.name.trim().toLowerCase()));
+};
+
+const findAllByNames = (fields: FormField[], names: string[]): FormField[] => {
+  const normalizedNames = names.map((name) => name.trim().toLowerCase());
+  return fields.filter((field) => normalizedNames.includes(field.name.trim().toLowerCase()));
+};
+
+const unwrapMoneyValue = (input: unknown): unknown => {
+  const parsed = parseMaybeJson(input);
+  if (!isRecord(parsed)) return parsed;
+  for (const key of ["amount", "total", "total_amount", "totalAmount", "value", "text"]) {
+    if (parsed[key] !== undefined) return unwrapMoneyValue(parsed[key]);
+  }
+  return parsed;
 };
 
 const parseMaybeJson = (input: unknown): unknown => {

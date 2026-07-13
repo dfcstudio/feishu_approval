@@ -11,9 +11,34 @@ const testConfig: AppEnv = {
   APPROVAL_ATTACHMENT_FIELD_NAMES: ["付款凭证"],
   APPROVAL_APPLICANT_FIELD_NAMES: ["报销人"],
 };
+const storedEvidence = { id: "stored", documentType: "PAYMENT", ocrAmount: { toString: () => "10.00" }, riskLevel: "LOW", riskReasons: [], transactionId: null, paidAt: null, payee: null };
 
 describe("ApprovalAuditService", () => {
-  it("reuses cached OCR data for APPROVED and notifies submitter and approvers", async () => {
+  it("skips a duplicate APPROVED notification", async () => {
+    const db = {
+      approvalAuditRun: { findUnique: vi.fn().mockResolvedValue({ approvedNotifiedAt: new Date() }) },
+      paymentEvidence: { findFirst: vi.fn() },
+    } as unknown as PrismaClient;
+    const notifyService = { sendAuditResult: vi.fn() };
+    const service = new ApprovalAuditService({
+      db,
+      config: testConfig,
+      feishuClient: {} as never,
+      storageProvider: {} as never,
+      ocrProvider: {} as never,
+      dedupeService: {} as never,
+      notifyService: notifyService as never,
+    });
+
+    await expect(service.audit("inst_notified", true, "APPROVED")).resolves.toEqual({
+      skipped: true,
+      evidenceIds: [],
+    });
+    expect(db.paymentEvidence.findFirst).not.toHaveBeenCalled();
+    expect(notifyService.sendAuditResult).not.toHaveBeenCalled();
+  });
+
+  it("reuses cached OCR data for APPROVED and notifies handlers once", async () => {
     const cachedEvidence = {
       id: "cached_1",
       approvalName: null,
@@ -29,7 +54,7 @@ describe("ApprovalAuditService", () => {
     };
     const db = {
       paymentEvidence: { findFirst: vi.fn().mockResolvedValue(cachedEvidence) },
-      approvalAuditRun: { findUnique: vi.fn() },
+      approvalAuditRun: { findUnique: vi.fn().mockResolvedValue({ approvedNotifiedAt: null }), update: vi.fn() },
     } as unknown as PrismaClient;
     const feishuClient = {
       getApprovalInstanceDetail: vi.fn().mockResolvedValue({
@@ -37,7 +62,7 @@ describe("ApprovalAuditService", () => {
         approvalCode: "CB1E3C0E-073F-4C01-A6D1-6EBF27207BBB",
         submitterOpenId: "ou_submitter",
         approverOpenIds: ["ou_approver"],
-        form: [],
+        form: [{ name: "办理人", value: [{ open_id: "ou_handler" }] }],
         raw: {},
       }),
       downloadApprovalFile: vi.fn(),
@@ -62,8 +87,12 @@ describe("ApprovalAuditService", () => {
     expect(feishuClient.downloadApprovalFile).not.toHaveBeenCalled();
     expect(notifyService.sendAuditResult).toHaveBeenCalledWith(expect.objectContaining({
       approvalName: "费用报销（有票）",
-      extraRecipientOpenIds: ["ou_submitter", "ou_approver"],
+      extraRecipientOpenIds: ["ou_handler"],
     }));
+    expect(db.approvalAuditRun.update).toHaveBeenCalledWith({
+      where: { instanceCode: "inst_cached" },
+      data: { approvedNotifiedAt: expect.any(Date) },
+    });
   });
 
   it("backfills original file storage for an approved approval without creating duplicate evidence", async () => {
@@ -77,7 +106,9 @@ describe("ApprovalAuditService", () => {
         findFirst: vi.fn().mockResolvedValue({ id: "evidence_1", storageKey: null }),
         update: vi.fn().mockResolvedValue({}),
         create: vi.fn(),
+        findMany: vi.fn().mockResolvedValue([storedEvidence]),
       },
+      approvalAuditSummary: { upsert: vi.fn() },
     } as unknown as PrismaClient;
 
     const storageProvider = {
@@ -119,7 +150,7 @@ describe("ApprovalAuditService", () => {
     expect(db.paymentEvidence.create).not.toHaveBeenCalled();
     expect(ocrProvider.recognizePaymentEvidence).not.toHaveBeenCalled();
     expect(dedupeService.findAndPersistMatches).not.toHaveBeenCalled();
-    expect(notifyService.sendAuditResult).not.toHaveBeenCalled();
+    expect(notifyService.sendAuditResult).toHaveBeenCalledOnce();
     expect(notifyService.sendOriginalFileSaved).toHaveBeenCalledWith({
       serialNumber: undefined,
       instanceCode: "inst_1",
@@ -145,7 +176,9 @@ describe("ApprovalAuditService", () => {
       paymentEvidence: {
         create: vi.fn().mockResolvedValue({ id: "evidence_2" }),
         update: vi.fn().mockResolvedValue({}),
+        findMany: vi.fn().mockResolvedValue([storedEvidence]),
       },
+      approvalAuditSummary: { upsert: vi.fn() },
     } as unknown as PrismaClient;
 
     const notifyService = {
@@ -187,10 +220,10 @@ describe("ApprovalAuditService", () => {
     expect(result.warning).toContain("Notification failed: message API unavailable");
     expect(db.approvalAuditRun.update).toHaveBeenLastCalledWith({
       where: { instanceCode: "inst_2" },
-      data: {
+      data: expect.objectContaining({
         status: "SUCCESS_WITH_WARNING",
         errorMessage: "Notification failed: message API unavailable",
-      },
+      }),
     });
   });
 
@@ -204,7 +237,9 @@ describe("ApprovalAuditService", () => {
       paymentEvidence: {
         create: vi.fn().mockResolvedValue({ id: "evidence_4" }),
         update: vi.fn().mockResolvedValue({}),
+        findMany: vi.fn().mockResolvedValue([storedEvidence]),
       },
+      approvalAuditSummary: { upsert: vi.fn() },
     } as unknown as PrismaClient;
 
     const notifyService = {
@@ -267,7 +302,9 @@ describe("ApprovalAuditService", () => {
         create: vi.fn().mockRejectedValue({ code: "P2002" }),
         findFirst: vi.fn().mockResolvedValue({ id: "existing_evidence" }),
         update: vi.fn(),
+        findMany: vi.fn().mockResolvedValue([storedEvidence]),
       },
+      approvalAuditSummary: { upsert: vi.fn() },
     } as unknown as PrismaClient;
 
     const dedupeService = { findAndPersistMatches: vi.fn() };
@@ -309,6 +346,6 @@ describe("ApprovalAuditService", () => {
 
     expect(result).toEqual({ skipped: false, evidenceIds: ["existing_evidence"] });
     expect(dedupeService.findAndPersistMatches).not.toHaveBeenCalled();
-    expect(notifyService.sendAuditResult).not.toHaveBeenCalled();
+    expect(notifyService.sendAuditResult).toHaveBeenCalledOnce();
   });
 });

@@ -1,6 +1,9 @@
 import type { AppEnv } from "../../config/env.js";
 import type { FeishuClient } from "../feishu/FeishuClient.js";
 import type { DuplicateMatchResult } from "../dedupe/DedupeService.js";
+import type { Prisma, PrismaClient, RiskLevel } from "@prisma/client";
+import type { ApprovalApprover } from "../feishu/feishuTypes.js";
+import { NotificationRouter, type NotificationRecipient } from "./NotificationRouter.js";
 
 export interface AuditNotificationInput {
   serialNumber?: string | null;
@@ -17,6 +20,14 @@ export interface AuditNotificationInput {
   riskReasons: string[];
   duplicateMatches: DuplicateMatchResult[];
   extraRecipientOpenIds?: string[];
+  applicantId?: string | null;
+  departmentIds?: string[];
+  currentApprovers?: ApprovalApprover[];
+  notificationKey?: string;
+  documentSummary?: {
+    paymentDocumentCount: number; paymentRecognizedCount: number; paymentTotal?: string | null; paymentTotalMatched?: boolean | null;
+    invoiceDocumentCount: number; invoiceRecognizedCount: number; invoiceTotal?: string | null; invoiceTotalMatched?: boolean | null;
+  };
 }
 
 const RISK_CN: Record<string, string> = {
@@ -52,13 +63,15 @@ const riskEmoji = (level: string): string => {
 };
 
 export class FeishuNotifyService {
+  private readonly router: NotificationRouter;
   constructor(
     private readonly feishuClient: FeishuClient,
     private readonly config: Pick<
       AppEnv,
       "FEISHU_NOTIFY_RECEIVE_ID_TYPE" | "FEISHU_NOTIFY_RECEIVE_ID" | "FEISHU_APPROVAL_DETAIL_URL_TEMPLATE"
     >,
-  ) {}
+    private readonly db?: PrismaClient,
+  ) { this.router = new NotificationRouter(db, config); }
 
   async sendAuditResult(input: AuditNotificationInput): Promise<void> {
     const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
@@ -103,6 +116,14 @@ export class FeishuNotifyService {
         },
       },
     ];
+
+    if (input.documentSummary) {
+      const s = input.documentSummary;
+      elements.push({ tag: "hr" }, { tag: "div", text: { tag: "lark_md", content: [
+        `**付款凭证汇总：**${s.paymentRecognizedCount}/${s.paymentDocumentCount} 张，合计 ${s.paymentTotal ?? "无法计算"}，${formatSummaryMatched(s.paymentTotalMatched)}`,
+        `**发票汇总：**${s.invoiceRecognizedCount}/${s.invoiceDocumentCount} 张，合计 ${s.invoiceTotal ?? "无法计算"}，${formatSummaryMatched(s.invoiceTotalMatched)}`,
+      ].join("\n") } });
+    }
 
     if (input.duplicateMatches.length > 0) {
       const seenMatches = new Set<string>();
@@ -169,19 +190,14 @@ export class FeishuNotifyService {
       elements,
     };
 
-    await this.feishuClient.sendInteractiveCard({
-      receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
-      receiveId: this.config.FEISHU_NOTIFY_RECEIVE_ID,
-      card,
+    const recipients = await this.router.resolve({
+      riskLevel: input.riskLevel as RiskLevel, applicantId: input.applicantId,
+      departmentIds: input.departmentIds ?? [], currentApprovers: input.currentApprovers ?? [],
+      extraRecipientOpenIds: input.extraRecipientOpenIds,
     });
-
-    const recipients = [...new Set(input.extraRecipientOpenIds ?? [])]
-      .filter((receiveId) => receiveId && receiveId !== this.config.FEISHU_NOTIFY_RECEIVE_ID);
-    await Promise.allSettled(
-      recipients.map((receiveId) =>
-        this.feishuClient.sendInteractiveCard({ receiveIdType: "open_id", receiveId, card }),
-      ),
-    );
+    await Promise.all(recipients.map((recipient) => this.deliverOrEnqueueCard(
+      `${input.notificationKey ?? `audit:${input.instanceCode}`}:${recipient.receiveIdType}:${recipient.receiveId}`, recipient, card,
+    )));
   }
 
   async sendManualReviewWarning(input: {
@@ -192,10 +208,12 @@ export class FeishuNotifyService {
   }): Promise<void> {
     const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
 
-    await this.feishuClient.sendInteractiveCard({
+    await this.deliverOrEnqueueCard(`warning:${input.instanceCode}:${input.errorCode}`, {
       receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
       receiveId: this.config.FEISHU_NOTIFY_RECEIVE_ID,
-      card: {
+      role: "FIXED_GROUP",
+    },
+    {
         config: { wide_screen_mode: true },
         header: {
           title: { tag: "plain_text", content: "报销辅助审核 ⚪ 需人工处理" },
@@ -235,8 +253,7 @@ export class FeishuNotifyService {
             ],
           },
         ],
-      },
-    });
+      });
   }
 
   async sendOriginalFileSaved(input: {
@@ -247,10 +264,11 @@ export class FeishuNotifyService {
   }): Promise<void> {
     const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
 
-    await this.feishuClient.sendInteractiveCard({
+    await this.deliverOrEnqueueCard(`saved:${input.instanceCode}:${input.storageKey ?? input.fileName}`, {
       receiveIdType: this.config.FEISHU_NOTIFY_RECEIVE_ID_TYPE,
       receiveId: this.config.FEISHU_NOTIFY_RECEIVE_ID,
-      card: {
+      role: "FIXED_GROUP",
+    }, {
         config: { wide_screen_mode: true },
         header: {
           title: { tag: "plain_text", content: "报销凭证原件已保存" },
@@ -281,8 +299,38 @@ export class FeishuNotifyService {
             ],
           },
         ],
-      },
-    });
+      });
+  }
+
+  async processNext(): Promise<boolean> {
+    if (!this.db) return false;
+    const now = new Date();
+    const item = await this.db.notificationOutbox.findFirst({ where: { OR: [
+      { status: { in: ["PENDING", "FAILED"] }, nextRetryAt: { lte: now } }, { status: "SENDING", leaseUntil: { lt: now } },
+    ] }, orderBy: { nextRetryAt: "asc" } });
+    if (!item) return false;
+    const claimed = await this.db.notificationOutbox.updateMany({ where: { id: item.id, OR: [
+      { status: { in: ["PENDING", "FAILED"] } }, { status: "SENDING", leaseUntil: { lt: now } },
+    ] }, data: { status: "SENDING", leaseUntil: new Date(Date.now() + 60_000) } });
+    if (!claimed.count) return false;
+    try {
+      const payload = item.payload as unknown as { receiveIdType: NotificationRecipient["receiveIdType"]; receiveId: string; card: Record<string, unknown> };
+      await this.feishuClient.sendInteractiveCard(payload);
+      await this.db.notificationOutbox.update({ where: { id: item.id }, data: { status: "SENT", sentAt: new Date(), leaseUntil: null } });
+    } catch (error) {
+      await this.db.notificationOutbox.update({ where: { id: item.id }, data: { status: "FAILED", retryCount: { increment: 1 }, nextRetryAt: new Date(Date.now() + 30_000), leaseUntil: null, lastError: error instanceof Error ? error.message : String(error) } });
+    }
+    return true;
+  }
+
+  private async deliverOrEnqueueCard(dedupeKey: string, recipient: NotificationRecipient, card: Record<string, unknown>): Promise<void> {
+    const payload = { receiveIdType: recipient.receiveIdType, receiveId: recipient.receiveId, card };
+    if (!recipient.receiveId) return;
+    if (!this.db) return this.feishuClient.sendInteractiveCard(payload);
+    await this.db.notificationOutbox.upsert({ where: { dedupeKey }, create: {
+      kind: "FEISHU_INTERACTIVE", dedupeKey, recipientRole: recipient.role,
+      receiveIdType: recipient.receiveIdType, receiveId: recipient.receiveId, payload: payload as Prisma.InputJsonValue,
+    }, update: {} });
   }
 }
 
@@ -291,6 +339,7 @@ const formatAmountMatched = (value: boolean | null): string => {
   if (value === false) return "❌ 不一致";
   return "⚠️ 无法判断";
 };
+const formatSummaryMatched = (value?: boolean | null): string => value == null ? "无可比附件" : value ? "✅ 与费用明细汇总一致" : "❌ 与费用明细汇总不一致";
 
 const formatValue = (value: unknown): string => {
   if (!value) return "未识别";

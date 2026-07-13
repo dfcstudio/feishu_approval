@@ -31,6 +31,7 @@ const extractAmount = (text: string): string | undefined => {
     /(?:实付|支付|付款|金额|合计|total|amount)\s*[:：]?\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*(?:元)?/i,
     /(?:RMB|CNY|[￥¥])\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/i,
     /(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*元/,
+    /^\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2}))\s*$/m,
   ];
 
   for (const pattern of patterns) {
@@ -42,7 +43,7 @@ const extractAmount = (text: string): string | undefined => {
 
 const extractTransactionId = (text: string): string | undefined => {
   const match = text.match(
-    /(?:交易号|订单号|流水号|商户单号|transaction\s*id|order\s*id)\s*[:：]?\s*([A-Za-z0-9_-]{6,64})/i,
+    /(?:交易单号|交易号|订单号|流水号|商户单号|transaction\s*id|order\s*id)\s*[:：]?\s*([A-Za-z0-9_-]{6,64})/i,
   );
   return match?.[1];
 };
@@ -56,7 +57,7 @@ const extractPaidAt = (text: string): string | undefined => {
 };
 
 const extractPayee = (text: string): string | undefined => {
-  const match = text.match(/(?:收款方|商户|对方账户|收款账户)\s*[:：]?\s*([^\n\r]{2,40})/);
+  const match = text.match(/(?:商户全称|收款方|商户名称|商户|对方账户|收款账户)\s*[:：]?\s*([^\n\r]{2,60})/);
   return match?.[1]?.trim();
 };
 

@@ -22,6 +22,7 @@ const ocrJsonSchema = z.object({
 });
 
 type VisionModelResponse = {
+  md_results?: string;
   output_text?: string;
   output?: Array<{
     content?: Array<{
@@ -77,6 +78,21 @@ export class AIVisionOCRProvider implements OCRProvider {
       ? { buffer: await convertPdfToPng(input.fileBuffer), mimeType: "image/png" }
       : { buffer: input.fileBuffer, mimeType };
     const dataUrl = toDataUrl(visionInput.buffer, visionInput.mimeType);
+
+    if (isGlmOcr(this.config)) {
+      const response = await postWithOcrErrorHandling(() =>
+        this.http.post<VisionModelResponse>("/layout_parsing", {
+          model: this.config.AI_VISION_MODEL.toLowerCase(),
+          file: dataUrl,
+        }),
+      );
+      const rawText = response.data.md_results?.trim();
+      if (!rawText) {
+        throw new AppError("GLM-OCR response did not contain md_results", "AI_OCR_EMPTY_RESPONSE", 502);
+      }
+      return extractPaymentFields(rawText);
+    }
+
     const response = await retry(
       () => this.http.post<VisionModelResponse>(requestPath(this.config), requestBody(this.config, dataUrl)),
       { attempts: 2, delayMs: 800 },
@@ -88,6 +104,26 @@ export class AIVisionOCRProvider implements OCRProvider {
 }
 
 export class OpenAIVisionOCRProvider extends AIVisionOCRProvider {}
+
+const isGlmOcr = (config: AppEnv): boolean => config.AI_VISION_MODEL.trim().toLowerCase() === "glm-ocr";
+
+const postWithOcrErrorHandling = async (
+  request: () => Promise<{ data: VisionModelResponse }>,
+): Promise<{ data: VisionModelResponse }> => {
+  try {
+    return await retry(request, { attempts: 2, delayMs: 800 });
+  } catch (error) {
+    const upstreamMessage = axios.isAxiosError(error)
+      ? (error.response?.data as { error?: { message?: unknown } } | undefined)?.error?.message
+      : undefined;
+    throw new AppError(
+      typeof upstreamMessage === "string" ? `AI OCR request failed: ${upstreamMessage}` : "AI OCR request failed",
+      "AI_OCR_REQUEST_FAILED",
+      502,
+      { upstreamStatus: axios.isAxiosError(error) ? error.response?.status : undefined },
+    );
+  }
+};
 
 export const normalizeOcrJson = (text: string): PaymentOCRResult => {
   const parsed = ocrJsonSchema.safeParse(JSON.parse(extractJsonObject(text)));

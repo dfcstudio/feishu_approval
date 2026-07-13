@@ -65,12 +65,14 @@ const envSchema = z.object({
   FEISHU_VERIFICATION_TOKEN: z.string().default(""),
   FEISHU_ENCRYPT_KEY: z.string().default(""),
   FEISHU_API_BASE_URL: z.string().url().default("https://open.feishu.cn"),
+  // Approval form attachments are served from both Feishu application and CDN domains.
   FEISHU_FILE_DOWNLOAD_ALLOWED_HOSTS: csv(
-    "open.feishu.cn,*.feishu.cn,*.feishuapp.cn,*.larksuite.com,*.larksuitecdn.com",
+    "open.feishu.cn,*.feishu.cn,*.feishuapp.cn,*.feishucdn.com,*.larksuite.com,*.larksuitecdn.com",
   ),
   FEISHU_FILE_DOWNLOAD_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   FEISHU_NOTIFY_RECEIVE_ID_TYPE: z.enum(["open_id", "user_id", "chat_id"]).default("chat_id"),
   FEISHU_NOTIFY_RECEIVE_ID: z.string().default(""),
+  // Native approval details must use Feishu's AppLink protocol; the web /approval/detail route is not valid.
   FEISHU_APPROVAL_DETAIL_URL_TEMPLATE: z
     .string()
     .default(
@@ -84,16 +86,27 @@ const envSchema = z.object({
   AI_VISION_BASE_URL: fallbackUrlEnv("OPENAI_BASE_URL", "https://api.openai.com"),
   AI_VISION_MODEL: fallbackStringEnv("OPENAI_VISION_MODEL", "gpt-4o-mini"),
   AI_VISION_API_STYLE: z.enum(["responses", "chat_completions"]).default("responses"),
-  APPROVAL_AMOUNT_FIELD_NAMES: csv("报销金额,金额,实付金额"),
+  APPROVAL_AMOUNT_FIELD_NAMES: csv("费用明细汇总,报销金额,金额,实付金额"),
   APPROVAL_ATTACHMENT_FIELD_NAMES: csv("付款凭证,支付截图,报销凭证,附件,图片/视频,图片"),
+  APPROVAL_INVOICE_FIELD_NAMES: csv("发票,发票附件,电子发票,发票图片"),
   APPROVAL_APPLICANT_FIELD_NAMES: csv("申请人,报销人"),
+  APPROVAL_HANDLER_FIELD_NAMES: csv("办理人,经办人,付款办理人"),
   LOCAL_STORAGE_DIR: z.string().default("./data/evidences"),
   SAVE_ORIGINAL_FILE: booleanFromString.default(true),
   SAVE_OCR_RAW_TEXT: booleanFromString.default(false),
   PERCEPTUAL_HASH_DISTANCE_THRESHOLD: z.coerce.number().int().min(0).max(64).default(8),
+  AUDIT_WORKER_POLL_MS: z.coerce.number().int().min(100).default(1000),
+  AUDIT_JOB_LEASE_SECONDS: z.coerce.number().int().min(10).default(300),
+  AUDIT_JOB_MAX_RETRIES: z.coerce.number().int().min(1).default(5),
   OCR_PROVIDER: z.enum(["mock", "openai", "ai-vision", "openai-compatible"]).default("mock"),
 });
 
 export type AppEnv = z.infer<typeof envSchema>;
 
 export const env = envSchema.parse(process.env);
+
+if (env.NODE_ENV === "production") {
+  const missing = [["FEISHU_VERIFICATION_TOKEN", env.FEISHU_VERIFICATION_TOKEN], ["FEISHU_ENCRYPT_KEY", env.FEISHU_ENCRYPT_KEY]]
+    .filter(([, value]) => !value).map(([key]) => key);
+  if (missing.length) throw new Error(`Missing required production configuration: ${missing.join(", ")}`);
+}

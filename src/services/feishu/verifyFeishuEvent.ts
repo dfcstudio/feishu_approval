@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { createDecipheriv, createHash } from "node:crypto";
 import { AppError } from "../../utils/errors.js";
 import type { FeishuApprovalEvent, UnknownRecord } from "./feishuTypes.js";
 
@@ -41,13 +42,16 @@ export const verifyEventToken = (
   }
 };
 
-export const ensureNotEncrypted = (payload: FeishuWebhookPayload, encryptKey?: string): void => {
-  if (payload.encrypt) {
-    throw new AppError(
-      "Encrypted Feishu callback is not implemented in this MVP",
-      encryptKey ? "FEISHU_ENCRYPTED_CALLBACK_TODO" : "FEISHU_ENCRYPTED_CALLBACK_WITHOUT_KEY",
-      400,
-    );
+export const decryptFeishuPayload = (payload: FeishuWebhookPayload, encryptKey?: string): FeishuWebhookPayload => {
+  if (!payload.encrypt) return payload;
+  if (!encryptKey) throw new AppError("Encrypted callback received without key", "FEISHU_ENCRYPT_KEY_MISSING", 401);
+  try {
+    const key = createHash("sha256").update(encryptKey).digest();
+    const decipher = createDecipheriv("aes-256-cbc", key, key.subarray(0, 16));
+    const plaintext = Buffer.concat([decipher.update(Buffer.from(payload.encrypt, "base64")), decipher.final()]);
+    return parseFeishuWebhookPayload(JSON.parse(plaintext.toString("utf8")));
+  } catch {
+    throw new AppError("Cannot decrypt Feishu callback", "FEISHU_DECRYPT_FAILED", 401);
   }
 };
 

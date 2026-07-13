@@ -12,6 +12,7 @@ import type { OCRProvider } from "./services/ocr/OCRProvider.js";
 import { FeishuNotifyService } from "./services/notify/FeishuNotifyService.js";
 import { LocalStorageProvider } from "./services/storage/LocalStorageProvider.js";
 import { createFeishuWebhookRouter, type AuditServiceLike } from "./routes/feishuWebhook.js";
+import { ApprovalAuditJobService } from "./services/jobs/ApprovalAuditJobService.js";
 
 export const logger = pino({
   level: process.env.LOG_LEVEL ?? "info",
@@ -41,8 +42,10 @@ export const createApp = (overrides?: {
     overrides?.auditService ??
     (() => {
       const feishuClient = new FeishuClient(config);
-      const notifyService = new FeishuNotifyService(feishuClient, config);
-      return new ApprovalAuditService({
+      const notifyService = new FeishuNotifyService(feishuClient, config, prisma);
+      const outboxTimer = setInterval(() => void notifyService.processNext(), config.AUDIT_WORKER_POLL_MS);
+      outboxTimer.unref();
+      const processor = new ApprovalAuditService({
         feishuClient,
         ocrProvider: createOCRProvider(config),
         storageProvider: new LocalStorageProvider(config.LOCAL_STORAGE_DIR),
@@ -51,6 +54,9 @@ export const createApp = (overrides?: {
         db: prisma,
         config,
       });
+      const jobs = new ApprovalAuditJobService(prisma, processor, config);
+      jobs.start();
+      return jobs;
     })();
 
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));

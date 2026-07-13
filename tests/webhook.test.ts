@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { env, type AppEnv } from "../src/config/env.js";
 import { ApprovalAuditService } from "../src/services/approval/ApprovalAuditService.js";
 import { handleFeishuApprovalWebhook, type AuditServiceLike } from "../src/routes/feishuWebhook.js";
+import { createCipheriv, createHash } from "node:crypto";
 
 const testConfig: AppEnv = {
   ...env,
@@ -107,5 +108,17 @@ describe("Feishu webhook", () => {
 
     expect(response.status).toBe(200);
     expect(auditService.audit).toHaveBeenCalledWith("inst_approved", true, "APPROVED");
+  });
+
+  it("decrypts encrypted callbacks before enqueue", async () => {
+    const auditService = { audit: vi.fn().mockResolvedValue({ queued: true }) };
+    const encryptKey = "test-encrypt-key";
+    const plain = JSON.stringify({ header: { event_type: "approval_instance_status_changed", token: "verify_token" }, event: { instance_code: "inst_encrypted", status: "PENDING" } });
+    const key = createHash("sha256").update(encryptKey).digest();
+    const cipher = createCipheriv("aes-256-cbc", key, key.subarray(0, 16));
+    const encrypt = Buffer.concat([cipher.update(plain), cipher.final()]).toString("base64");
+    const response = await handleFeishuApprovalWebhook({ encrypt }, { config: { ...testConfig, FEISHU_ENCRYPT_KEY: encryptKey }, auditService, logger: testLogger });
+    expect(response.status).toBe(200);
+    expect(auditService.audit).toHaveBeenCalledWith("inst_encrypted", false, "PENDING");
   });
 });
