@@ -3,7 +3,9 @@ import type { AppEnv } from "../../config/env.js";
 import { env } from "../../config/env.js";
 import { prisma } from "../../db/prisma.js";
 import { AppError, BusinessError, toErrorMessage } from "../../utils/errors.js";
+import { sanitizeDatabaseText } from "../../utils/databaseText.js";
 import { centsToDecimal, decimalToCents, moneyEquals } from "../../utils/money.js";
+import { isLikelyUserId } from "../../utils/userIdentity.js";
 import type { DedupeService, DuplicateMatchResult } from "../dedupe/DedupeService.js";
 import { HashService } from "../dedupe/HashService.js";
 import { ImageHashService } from "../dedupe/ImageHashService.js";
@@ -13,6 +15,7 @@ import type { OCRProvider } from "../ocr/OCRProvider.js";
 import type { StorageProvider } from "../storage/StorageProvider.js";
 import type { FeishuNotifyService } from "../notify/FeishuNotifyService.js";
 import { parseApprovalForm } from "./parseApprovalForm.js";
+import { extractInvoiceBuyerName, invoiceTitleMatches } from "./invoiceTitle.js";
 
 const APPROVAL_NAME_MAP: Record<string, string> = {
   "BA2807BA-3FEC-4160-BAF8-F0F0FE91E109": "采购报销（有票）",
@@ -38,6 +41,7 @@ export class ApprovalAuditService {
       feishuClient: FeishuClient;
       ocrProvider: OCRProvider;
       storageProvider: StorageProvider;
+      reviewStorageProvider?: StorageProvider;
       dedupeService: DedupeService;
       notifyService: FeishuNotifyService;
       db?: PrismaClient;
@@ -50,74 +54,8 @@ export class ApprovalAuditService {
   async audit(instanceCode: string, saveFiles = true, status?: string): Promise<ApprovalAuditResult> {
     const db = this.deps.db ?? prisma;
     const config = this.deps.config ?? env;
-
-    if (status?.toUpperCase() === "APPROVED") {
-      const auditRun = await db.approvalAuditRun.findUnique({ where: { instanceCode } });
-      if (auditRun?.approvedNotifiedAt) {
-        return { skipped: true, evidenceIds: [] };
-      }
-      const cachedEvidence = await db.paymentEvidence.findFirst({
-        where: { instanceCode },
-        orderBy: { createdAt: "desc" },
-      });
-      if (cachedEvidence) {
-        let detail: Awaited<ReturnType<FeishuClient["getApprovalInstanceDetail"]>> | undefined;
-        try {
-          detail = await this.deps.feishuClient.getApprovalInstanceDetail(instanceCode);
-        } catch {
-          // Cached notification can still be sent while Feishu detail lookup is temporarily unavailable.
-        }
-        const notificationWarning = await notifyBestEffort(() =>
-          this.deps.notifyService.sendAuditResult({
-            notificationKey: `audit-approved:${instanceCode}`,
-            serialNumber: detail?.serialNumber,
-            instanceCode,
-            approvalName:
-              cachedEvidence.approvalName ??
-              (detail?.approvalCode ? APPROVAL_NAME_MAP[detail.approvalCode] : undefined) ??
-              detail?.approvalName,
-            applicantName: cachedEvidence.applicantName ?? detail?.applicantName,
-            approvalAmount: cachedEvidence.approvalAmount.toString(),
-            ocrAmount: cachedEvidence.ocrAmount?.toString(),
-            amountMatched: cachedEvidence.amountMatched,
-            transactionId: cachedEvidence.transactionId,
-            paidAt: cachedEvidence.paidAt,
-            payee: cachedEvidence.payee,
-            riskLevel: cachedEvidence.riskLevel,
-            riskReasons: Array.isArray(cachedEvidence.riskReasons)
-              ? cachedEvidence.riskReasons.filter((reason): reason is string => typeof reason === "string")
-              : [],
-            duplicateMatches: [],
-            extraRecipientOpenIds: approvedRecipientOpenIds(detail, config),
-            applicantId: detail?.applicantId,
-            departmentIds: detail?.applicantDepartmentIds ?? [],
-            currentApprovers: detail?.currentApprovers ?? [],
-          }),
-        );
-        if (!notificationWarning && detail) {
-          await db.approvalAuditRun.update({
-            where: { instanceCode },
-            data: { approvedNotifiedAt: new Date() },
-          });
-        }
-        return {
-          skipped: true,
-          evidenceIds: [cachedEvidence.id],
-          ...(notificationWarning ? { warning: notificationWarning } : {}),
-        };
-      }
-    }
-
-    const existing = await db.approvalAuditRun.findUnique({ where: { instanceCode } });
-    if (!saveFiles && (existing?.status === "SUCCESS" || existing?.status === "SUCCESS_WITH_WARNING")) {
-      return { skipped: true, evidenceIds: [] };
-    }
-
-    await db.approvalAuditRun.upsert({
-      where: { instanceCode },
-      create: { instanceCode, status: "PROCESSING" },
-      update: { status: "PROCESSING", errorMessage: null },
-    });
+    const skipped = await this.prepareAuditRun(db, instanceCode, saveFiles, status);
+    if (skipped) return skipped;
 
     let approval: ParsedApprovalForm | undefined;
     try {
@@ -134,6 +72,10 @@ export class ApprovalAuditService {
 
       for (const attachment of approval.attachments) {
         const fileBuffer = await this.deps.feishuClient.downloadApprovalFile(attachment);
+        // Feishu sometimes returns only a signed download URL and no filename or
+        // MIME type. Detect spreadsheets from their bytes so an attached expense
+        // workbook is not counted as an invoice that failed OCR.
+        if (attachment.documentType === "INVOICE" && isSpreadsheetFile(fileBuffer)) continue;
         const fileName = attachment.name ?? `${attachment.fileToken}.bin`;
         const mimeType = attachment.mimeType;
         const sha256 = (this.deps.hashService ?? new HashService()).sha256(fileBuffer);
@@ -148,6 +90,19 @@ export class ApprovalAuditService {
           : null;
 
         if (existingEvidence?.storageKey) {
+          await db.paymentEvidence.update({
+            where: { id: existingEvidence.id },
+            data: {
+              approvalAmount: approval.approvalAmount,
+              approvalName,
+              applicantId: approval.applicantId,
+              applicantName: approval.applicantName,
+              fileToken: attachment.fileToken,
+              fileName,
+              mimeType,
+              fileSize: attachment.size ?? fileBuffer.byteLength,
+            },
+          });
           evidenceIds.push(existingEvidence.id);
           continue;
         }
@@ -166,7 +121,6 @@ export class ApprovalAuditService {
               storageKey: storage.storageKey,
               perceptualHash,
               fileToken: attachment.fileToken,
-              documentType: attachment.documentType,
             },
           });
           if (storage.storageKey) {
@@ -184,18 +138,49 @@ export class ApprovalAuditService {
           continue;
         }
 
-        const ocr = await this.deps.ocrProvider.recognizePaymentEvidence({
-          fileBuffer,
-          fileName,
-          mimeType,
+        let ocr;
+        let ocrFailed = false;
+        try {
+          ocr = await this.deps.ocrProvider.recognizePaymentEvidence({ fileBuffer, fileName, mimeType });
+        } catch (error) {
+          ocr = { rawText: "", confidence: 0 };
+          ocrFailed = true;
+          notificationWarnings.push(`OCR failed for one attachment: ${toErrorMessage(error)}`);
+        }
+        ocr = {
+          ...ocr,
+          rawText: sanitizeDatabaseText(ocr.rawText) ?? "",
+          transactionId: sanitizeDatabaseText(ocr.transactionId),
+          paidAt: sanitizeDatabaseText(ocr.paidAt),
+          payee: sanitizeDatabaseText(ocr.payee),
+        };
+        const ocrConfidenceScore = toOcrConfidenceScore(ocr.confidence);
+        let ocrReviewStorageKey: string | null = null;
+        if (ocrConfidenceScore === 1 && this.deps.reviewStorageProvider) {
+          try {
+            const reviewCopy = await this.deps.reviewStorageProvider.save({ buffer: fileBuffer, fileName, mimeType });
+            ocrReviewStorageKey = reviewCopy.storageKey;
+          } catch (error) {
+            notificationWarnings.push(`Cannot save low-confidence OCR review copy: ${toErrorMessage(error)}`);
+          }
+        }
+        const documentType = classifyDocumentType(attachment.documentType, ocr.rawText, {
+          amount: ocr.amount,
+          transactionId: ocr.transactionId,
+          paidAt: ocr.paidAt,
         });
+        const invoiceBuyerName = documentType === "INVOICE" ? extractInvoiceBuyerName(ocr.rawText) : undefined;
+        const invoiceTitleMatched = documentType === "INVOICE" && approval.receivingUnit && invoiceBuyerName
+          ? invoiceTitleMatches(approval.receivingUnit, invoiceBuyerName, config.INVOICE_TITLE_ALIASES)
+          : null;
         const paidAt = parseDate(ocr.paidAt);
         const amountMatched = Boolean(ocr.amount);
-        const initialRisk = determineRisk({
-          amountMatched,
-          ocrAmount: ocr.amount,
-          duplicateMatches: [],
-        });
+        const initialRisk = documentType === "SUPPORTING"
+          ? { riskLevel: "LOW" as const, riskReasons: ["SUPPORTING_DOCUMENT"] }
+          : determineRisk({ amountMatched, ocrAmount: ocr.amount, duplicateMatches: [] });
+        if (ocrFailed) initialRisk.riskReasons.push("OCR_PROCESSING_FAILED");
+        applyOcrConfidenceRisk(initialRisk, ocrConfidenceScore);
+        applyInvoiceTitleRisk(initialRisk, documentType, approval.receivingUnit, invoiceBuyerName, invoiceTitleMatched);
 
         let evidence: { id: string };
         try {
@@ -203,7 +188,9 @@ export class ApprovalAuditService {
             data: {
               instanceCode: approval.instanceCode,
               fileToken: attachment.fileToken,
-              documentType: attachment.documentType,
+              documentType,
+              invoiceBuyerName,
+              invoiceTitleMatched,
               applicantId: approval.applicantId,
               applicantName: approval.applicantName,
               approvalName,
@@ -221,6 +208,8 @@ export class ApprovalAuditService {
               perceptualHash,
               ocrRawText: config.SAVE_OCR_RAW_TEXT ? ocr.rawText : null,
               ocrConfidence: ocr.confidence,
+              ocrConfidenceScore,
+              ocrReviewStorageKey,
               riskLevel: initialRisk.riskLevel,
               riskReasons: initialRisk.riskReasons,
             },
@@ -258,12 +247,19 @@ export class ApprovalAuditService {
           continue;
         }
 
+        if (documentType === "SUPPORTING") {
+          evidenceIds.push(evidence.id);
+          continue;
+        }
+
         const duplicateMatches = await this.deps.dedupeService.findAndPersistMatches({
           currentEvidenceId: evidence.id,
+          instanceCode: approval.instanceCode,
           sha256,
           transactionId: ocr.transactionId,
           perceptualHash,
           approvalAmount: approval.approvalAmount,
+          ocrAmount: ocr.amount,
           paidAt,
           payee: ocr.payee,
         });
@@ -273,6 +269,9 @@ export class ApprovalAuditService {
           ocrAmount: ocr.amount,
           duplicateMatches,
         });
+        if (ocrFailed) finalRisk.riskReasons.push("OCR_PROCESSING_FAILED");
+        applyOcrConfidenceRisk(finalRisk, ocrConfidenceScore);
+        applyInvoiceTitleRisk(finalRisk, documentType, approval.receivingUnit, invoiceBuyerName, invoiceTitleMatched);
 
         await db.paymentEvidence.update({
           where: { id: evidence.id },
@@ -285,73 +284,118 @@ export class ApprovalAuditService {
         evidenceIds.push(evidence.id);
       }
 
-      const storedEvidences = await db.paymentEvidence.findMany({ where: { instanceCode: approval.instanceCode }, orderBy: { createdAt: "asc" } });
-      const summary = summarizeStoredEvidences(approval.approvalAmount, storedEvidences.map((item) => ({
-        documentType: item.documentType as "PAYMENT" | "INVOICE", ocrAmount: item.ocrAmount?.toString(),
-        riskLevel: item.riskLevel, riskReasons: Array.isArray(item.riskReasons) ? item.riskReasons.filter((r): r is string => typeof r === "string") : [],
-      })));
-      await db.approvalAuditSummary.upsert({ where: { instanceCode: approval.instanceCode }, create: { instanceCode: approval.instanceCode, ...summary }, update: summary });
-      const representative = storedEvidences[0];
-      const notificationWarning = await notifyBestEffort(() => this.deps.notifyService.sendAuditResult({
-        notificationKey: `audit-summary:${approval!.instanceCode}`,
-        serialNumber: approval?.serialNumber, approvalName, instanceCode: approval?.instanceCode ?? instanceCode,
-        applicantId: approval?.applicantId, applicantName: approval?.applicantName,
-        departmentIds: approval?.applicantDepartmentIds ?? [], currentApprovers: approval?.currentApprovers ?? [],
-        approvalAmount: approval?.approvalAmount ?? "0.00", ocrAmount: representative?.ocrAmount?.toString(),
-        amountMatched: [summary.paymentTotalMatched, summary.invoiceTotalMatched].filter((v) => v !== null).every(Boolean),
-        transactionId: representative?.transactionId, paidAt: representative?.paidAt, payee: representative?.payee,
-        riskLevel: summary.riskLevel, riskReasons: summary.riskReasons, duplicateMatches: allDuplicateMatches,
-        documentSummary: summary,
-        extraRecipientOpenIds: status?.toUpperCase() === "APPROVED" ? (approval?.handlerOpenIds ?? []) : pendingRecipientOpenIds(detail),
-      }));
-      if (notificationWarning) notificationWarnings.push(notificationWarning);
-
-      const combinedNotificationWarning = notificationWarnings.join("\n") || undefined;
-      await db.approvalAuditRun.update({
-        where: { instanceCode },
-        data: {
-          status: combinedNotificationWarning ? "SUCCESS_WITH_WARNING" : "SUCCESS",
-          errorMessage: combinedNotificationWarning ?? null,
-          leaseUntil: null, leaseOwner: null, finishedAt: new Date(),
-          ...(status?.toUpperCase() === "APPROVED" && !combinedNotificationWarning
-            ? { approvedNotifiedAt: new Date() }
-            : {}),
-        },
-      });
-
-      return {
-        skipped: false,
-        evidenceIds,
-        ...(combinedNotificationWarning ? { warning: combinedNotificationWarning } : {}),
-      };
-    } catch (error) {
-      const errorMessage = toErrorMessage(error);
-      const errorCode = error instanceof AppError ? error.errorCode : "AUDIT_FAILED";
-      const status = error instanceof BusinessError ? "SUCCESS_WITH_WARNING" : "FAILED";
-
-      await db.approvalAuditRun.update({
-        where: { instanceCode },
-        data: { status, errorMessage },
-      });
-
-      const notificationWarning = await notifyBestEffort(() =>
-        this.deps.notifyService.sendManualReviewWarning({
-          serialNumber: approval?.serialNumber,
-          instanceCode,
-          errorCode,
-          message: errorMessage,
-        }),
+      const notificationResult = await this.summarizeAndNotify(
+        db, approval, approvalName, detail, status, allDuplicateMatches,
       );
+      notificationWarnings.push(...notificationResult.warnings);
 
-      if (error instanceof BusinessError) {
-        return {
-          skipped: false,
-          evidenceIds: [],
-          warning: [errorMessage, notificationWarning].filter(Boolean).join("\n"),
-        };
-      }
-      throw error;
+      return this.completeAuditRun(
+        db, instanceCode, status, evidenceIds, notificationWarnings, notificationResult.delivered,
+      );
+    } catch (error) {
+      return this.failAuditRun(db, instanceCode, approval, error);
     }
+  }
+
+  private async prepareAuditRun(
+    db: PrismaClient, instanceCode: string, saveFiles: boolean, status?: string,
+  ): Promise<ApprovalAuditResult | undefined> {
+    const existing = await db.approvalAuditRun.findUnique({ where: { instanceCode } });
+    if (status?.toUpperCase() === "APPROVED" && existing?.approvedNotifiedAt) {
+      return { skipped: true, evidenceIds: [] };
+    }
+    if (!saveFiles && (existing?.status === "SUCCESS" || existing?.status === "SUCCESS_WITH_WARNING")) {
+      return { skipped: true, evidenceIds: [] };
+    }
+    await db.approvalAuditRun.upsert({
+      where: { instanceCode },
+      create: { instanceCode, status: "PROCESSING", requestedStatus: status?.toUpperCase() },
+      update: { status: "PROCESSING", errorMessage: null, ...(status ? { requestedStatus: status.toUpperCase() } : {}) },
+    });
+    return undefined;
+  }
+
+  private async summarizeAndNotify(
+    db: PrismaClient,
+    approval: ParsedApprovalForm,
+    approvalName: string | null | undefined,
+    detail: Awaited<ReturnType<FeishuClient["getApprovalInstanceDetail"]>>,
+    status: string | undefined,
+    duplicateMatches: DuplicateMatchResult[],
+  ): Promise<{ warnings: string[]; delivered: boolean }> {
+    const storedEvidences = await db.paymentEvidence.findMany({
+      where: { instanceCode: approval.instanceCode }, orderBy: { createdAt: "asc" },
+    });
+    const summary = summarizeStoredEvidences(approval.approvalAmount, storedEvidences.map((item) => ({
+      documentType: item.documentType as "PAYMENT" | "INVOICE" | "SUPPORTING",
+      ocrAmount: item.ocrAmount?.toString(), riskLevel: item.riskLevel,
+      riskReasons: Array.isArray(item.riskReasons)
+        ? item.riskReasons.filter((reason): reason is string => typeof reason === "string")
+        : [],
+    })));
+    await db.approvalAuditSummary.upsert({
+      where: { instanceCode: approval.instanceCode },
+      create: { instanceCode: approval.instanceCode, ...summary }, update: summary,
+    });
+    const representative = storedEvidences[0];
+    const isApproved = status?.toUpperCase() === "APPROVED";
+    const warning = await notifyBestEffort(() => this.deps.notifyService.sendAuditResult({
+      notificationKey: `${isApproved ? "audit-approved" : "audit-summary"}:${approval.instanceCode}`,
+      notificationStage: isApproved ? "APPROVED_HANDOFF" : "AUDIT",
+      serialNumber: approval.serialNumber, approvalName, instanceCode: approval.instanceCode,
+      applicantId: isApproved ? undefined : approval.applicantId, applicantName: approval.applicantName,
+      departmentIds: approval.applicantDepartmentIds, currentApprovers: isApproved ? [] : approval.currentApprovers,
+      approvalAmount: approval.approvalAmount,
+      ocrAmount: (summary.paymentDocumentCount > 0 ? summary.paymentTotal : summary.invoiceTotal)
+        ?? representative?.ocrAmount?.toString(),
+      amountMatched: [summary.paymentTotalMatched, summary.invoiceTotalMatched]
+        .filter((value) => value !== null).every(Boolean),
+      transactionId: representative?.transactionId, paidAt: representative?.paidAt, payee: representative?.payee,
+      riskLevel: summary.riskLevel, riskReasons: summary.riskReasons, duplicateMatches,
+      ocrConfidenceScore: storedEvidences.length
+        ? Math.min(...storedEvidences.map((item) => item.ocrConfidenceScore))
+        : undefined,
+      documentSummary: summary,
+      extraRecipientOpenIds: isApproved ? approval.handlerOpenIds : pendingRecipientOpenIds(detail),
+    }));
+    return { warnings: warning ? [warning] : [], delivered: !warning };
+  }
+
+  private async completeAuditRun(
+    db: PrismaClient, instanceCode: string, requestedStatus: string | undefined,
+    evidenceIds: string[], notificationWarnings: string[], approvedResultDelivered: boolean,
+  ): Promise<ApprovalAuditResult> {
+    const warning = notificationWarnings.join("\n") || undefined;
+    await db.approvalAuditRun.update({
+      where: { instanceCode },
+      data: {
+        status: warning ? "SUCCESS_WITH_WARNING" : "SUCCESS",
+        errorMessage: warning ?? null,
+        leaseUntil: null, leaseOwner: null, finishedAt: new Date(),
+        ...(requestedStatus?.toUpperCase() === "APPROVED" && approvedResultDelivered
+          ? { approvedNotifiedAt: new Date() }
+          : {}),
+      },
+    });
+    return { skipped: false, evidenceIds, ...(warning ? { warning } : {}) };
+  }
+
+  private async failAuditRun(
+    db: PrismaClient, instanceCode: string, approval: ParsedApprovalForm | undefined, error: unknown,
+  ): Promise<ApprovalAuditResult> {
+    const errorMessage = toErrorMessage(error);
+    const errorCode = error instanceof AppError ? error.errorCode : "AUDIT_FAILED";
+    await db.approvalAuditRun.update({
+      where: { instanceCode },
+      data: { status: error instanceof BusinessError ? "SUCCESS_WITH_WARNING" : "FAILED", errorMessage },
+    });
+    const notificationWarning = await notifyBestEffort(() => this.deps.notifyService.sendManualReviewWarning({
+      serialNumber: approval?.serialNumber, instanceCode, errorCode, message: errorMessage,
+    }));
+    if (error instanceof BusinessError) {
+      return { skipped: false, evidenceIds: [], warning: [errorMessage, notificationWarning].filter(Boolean).join("\n") };
+    }
+    throw error;
   }
 }
 
@@ -396,8 +440,38 @@ export const determineRisk = (input: {
   };
 };
 
+const applyInvoiceTitleRisk = (
+  decision: RiskDecision,
+  documentType: "PAYMENT" | "INVOICE" | "SUPPORTING",
+  receivingUnit?: string,
+  buyerName?: string,
+  matched?: boolean | null,
+): void => {
+  if (documentType !== "INVOICE") return;
+  if (!receivingUnit) {
+    decision.riskLevel = maxRisk(decision.riskLevel, "UNKNOWN");
+    if (!decision.riskReasons.includes("APPROVAL_RECEIVING_UNIT_NOT_FOUND")) decision.riskReasons.push("APPROVAL_RECEIVING_UNIT_NOT_FOUND");
+  } else if (!buyerName) {
+    decision.riskLevel = maxRisk(decision.riskLevel, "UNKNOWN");
+    if (!decision.riskReasons.includes("INVOICE_BUYER_NOT_FOUND")) decision.riskReasons.push("INVOICE_BUYER_NOT_FOUND");
+  } else if (matched === false) {
+    decision.riskLevel = maxRisk(decision.riskLevel, "MEDIUM");
+    if (!decision.riskReasons.includes("INVOICE_TITLE_MISMATCH")) decision.riskReasons.push("INVOICE_TITLE_MISMATCH");
+  }
+};
+
+/** Converts provider confidence (0..1) to the user-facing five-point scale. */
+export const toOcrConfidenceScore = (confidence: number): 1 | 2 | 3 | 4 | 5 =>
+  Math.max(1, Math.min(5, Math.ceil(confidence * 5))) as 1 | 2 | 3 | 4 | 5;
+
+const applyOcrConfidenceRisk = (decision: RiskDecision, score: number): void => {
+  if (score !== 1) return;
+  decision.riskLevel = maxRisk(decision.riskLevel, "UNKNOWN");
+  if (!decision.riskReasons.includes("OCR_CONFIDENCE_SCORE_1")) decision.riskReasons.push("OCR_CONFIDENCE_SCORE_1");
+};
+
 export const summarizeStoredEvidences = (expenseSummaryAmount: string, documents: Array<{
-  documentType: "PAYMENT" | "INVOICE"; ocrAmount?: string | null; riskLevel: RiskDecision["riskLevel"]; riskReasons: string[];
+  documentType: "PAYMENT" | "INVOICE" | "SUPPORTING"; ocrAmount?: string | null; riskLevel: RiskDecision["riskLevel"]; riskReasons: string[];
 }>) => {
   const summarize = (type: "PAYMENT" | "INVOICE") => {
     const selected = documents.filter((d) => d.documentType === type);
@@ -407,16 +481,73 @@ export const summarizeStoredEvidences = (expenseSummaryAmount: string, documents
   };
   const payment = summarize("PAYMENT"); const invoice = summarize("INVOICE");
   let riskLevel: RiskDecision["riskLevel"] = "LOW"; const reasons = new Set<string>();
-  for (const d of documents) { riskLevel = maxRisk(riskLevel, d.riskLevel); d.riskReasons.forEach((r) => reasons.add(r)); }
+  for (const d of documents.filter((item) => item.documentType !== "SUPPORTING")) {
+    riskLevel = maxRisk(riskLevel, d.riskLevel); d.riskReasons.forEach((r) => reasons.add(r));
+  }
+  for (const d of documents.filter((item) => item.riskReasons.includes("OCR_CONFIDENCE_SCORE_1"))) {
+    riskLevel = maxRisk(riskLevel, "UNKNOWN");
+    reasons.add("OCR_CONFIDENCE_SCORE_1");
+  }
   for (const [prefix, item] of [["PAYMENT", payment], ["INVOICE", invoice]] as const) {
     if (!item.count) continue;
     if (item.recognizedCount !== item.count) { riskLevel = maxRisk(riskLevel, "UNKNOWN"); reasons.add(`${prefix}_AMOUNT_INCOMPLETE`); }
     else if (!item.matched) { riskLevel = maxRisk(riskLevel, "MEDIUM"); reasons.add(`${prefix}_TOTAL_MISMATCH`); }
   }
+  if (payment.count === 0 && invoice.count === 0) {
+    riskLevel = maxRisk(riskLevel, "HIGH");
+    reasons.add("VALID_EVIDENCE_NOT_FOUND");
+  }
   return { expenseSummaryAmount, paymentDocumentCount: payment.count, paymentRecognizedCount: payment.recognizedCount,
     paymentTotal: payment.total, paymentTotalMatched: payment.matched, invoiceDocumentCount: invoice.count,
     invoiceRecognizedCount: invoice.recognizedCount, invoiceTotal: invoice.total, invoiceTotalMatched: invoice.matched,
+    supportingDocumentCount: documents.filter((item) => item.documentType === "SUPPORTING").length,
     riskLevel, riskReasons: [...reasons] };
+};
+
+const INVOICE_CONTENT_MARKERS = [
+  /发票(?:号码|代码)/u,
+  /购买方(?:信息|名称)?/u,
+  /销售方(?:信息|名称)?/u,
+  /价税合计/u,
+];
+
+/**
+ * Keep explicit invoice-field classification, and upgrade generic/payment
+ * attachments only when OCR text contains multiple independent invoice fields.
+ */
+export const classifyDocumentType = (
+  fieldType: "PAYMENT" | "INVOICE",
+  rawText?: string | null,
+  recognized?: { amount?: string | null; transactionId?: string | null; paidAt?: string | null },
+): "PAYMENT" | "INVOICE" | "SUPPORTING" => {
+  if (fieldType === "INVOICE") return "INVOICE";
+  const text = rawText?.replace(/\s+/gu, "") ?? "";
+  const markerCount = INVOICE_CONTENT_MARKERS.filter((marker) => marker.test(text)).length;
+  if (markerCount >= 2) return "INVOICE";
+  if (!recognized) return "PAYMENT";
+  const hasAmount = Boolean(recognized.amount) || /(?:¥|￥|金额|实付|转账)[：:]?-?\d+(?:\.\d{1,2})?/u.test(text);
+  const hasTransactionId = Boolean(recognized.transactionId)
+    || /(?:转账单号|交易单号|订单号|交易号|流水号|商户单号)[：:]?[A-Z0-9]{8,}/iu.test(text);
+  const hasPaidAt = Boolean(recognized.paidAt)
+    || /(?:转账时间|交易时间|支付时间|付款时间|创建时间)[：:]?20\d{2}年?\d{1,2}月?\d{1,2}日?/u.test(text);
+  const bankMarkerCount = [
+    /(?:交易卡号|交易账户|付款账号|付款账户)/u,
+    /(?:对方账户|对方户名|收款账户|收款户名)/u,
+    /(?:记账金额|交易金额|收支详情|业务摘要)/u,
+  ].filter((marker) => marker.test(text)).length;
+  const hasBankTransferDetails = bankMarkerCount >= 2;
+  return hasAmount && hasPaidAt && (hasTransactionId || hasBankTransferDetails) ? "PAYMENT" : "SUPPORTING";
+};
+
+export const isSpreadsheetFile = (buffer: Buffer): boolean => {
+  // XLSX/XLSM/XLSB are ZIP containers whose entry names are present in the
+  // central directory. This avoids adding a ZIP dependency just for detection.
+  if (buffer[0] === 0x50 && buffer[1] === 0x4b) {
+    const container = buffer.toString("latin1");
+    return container.includes("xl/workbook.") || container.includes("xl/worksheets/");
+  }
+  // Legacy binary .xls uses the OLE Compound File signature.
+  return buffer.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
 };
 
 const riskOrder: Record<RiskDecision["riskLevel"], number> = {
@@ -454,46 +585,6 @@ const pendingRecipientOpenIds = (
   ...(detail?.approverOpenIds ?? []),
 ];
 
-const approvedRecipientOpenIds = (
-  detail: Awaited<ReturnType<FeishuClient["getApprovalInstanceDetail"]>> | undefined,
-  config: AppEnv,
-): string[] => {
-  if (!detail) return [];
-  try {
-    return parseApprovalForm(detail, config).handlerOpenIds;
-  } catch {
-    // The approved notification can use cached audit data even if required audit fields later changed.
-    return extractHandlerOpenIds(detail.form, config.APPROVAL_HANDLER_FIELD_NAMES);
-  }
-};
-
-const extractHandlerOpenIds = (form: unknown, names: string[]): string[] => {
-  const parsed = typeof form === "string" ? safeJson(form) : form;
-  if (!Array.isArray(parsed)) return [];
-  const normalizedNames = new Set(names.map((name) => name.trim().toLowerCase()));
-  const ids = new Set<string>();
-  const visit = (value: unknown, inHandlerField = false): void => {
-    const current = typeof value === "string" ? safeJson(value) : value;
-    if (Array.isArray(current)) return current.forEach((item) => visit(item, inHandlerField));
-    if (!current || typeof current !== "object") return;
-    const record = current as Record<string, unknown>;
-    const fieldName = [record.name, record.field_name, record.fieldName, record.title, record.label]
-      .find((item): item is string => typeof item === "string");
-    const matches = inHandlerField || Boolean(fieldName && normalizedNames.has(fieldName.trim().toLowerCase()));
-    if (matches) {
-      const openId = [record.open_id, record.openId].find((item): item is string => typeof item === "string");
-      if (openId) ids.add(openId);
-    }
-    Object.values(record).forEach((item) => visit(item, matches));
-  };
-  visit(parsed);
-  return [...ids];
-};
-
-const safeJson = (value: string): unknown => {
-  try { return JSON.parse(value); } catch { return value; }
-};
-
 const resolveApplicantName = async (
   feishuClient: FeishuClient,
   approval: ParsedApprovalForm,
@@ -501,7 +592,7 @@ const resolveApplicantName = async (
 ): Promise<ParsedApprovalForm> => {
   const applicantId = approval.applicantId?.trim();
   const currentName = approval.applicantName?.trim();
-  if (!applicantId || (currentName && currentName !== applicantId)) return approval;
+  if (!applicantId || (currentName && currentName !== applicantId && !isLikelyUserId(currentName))) return approval;
 
   const mappedName = applicantNameMap[applicantId];
   if (mappedName) return { ...approval, applicantName: mappedName };

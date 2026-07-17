@@ -2,7 +2,6 @@ import { Router } from "express";
 import type { Logger } from "pino";
 import type { AppEnv } from "../config/env.js";
 import { AppError, toErrorMessage } from "../utils/errors.js";
-import type { ApprovalAuditService } from "../services/approval/ApprovalAuditService.js";
 import {
   decryptFeishuPayload,
   extractApprovalEvent,
@@ -14,10 +13,11 @@ import {
 
 export interface AuditServiceLike {
   audit(instanceCode: string, saveFiles: boolean, status?: string): Promise<unknown>;
+  recordStatus?(instanceCode: string, status: string): Promise<void>;
 }
 
 export interface FeishuWebhookDeps {
-  auditService: ApprovalAuditService | AuditServiceLike;
+  auditService: AuditServiceLike;
   config: Pick<AppEnv, "FEISHU_VERIFICATION_TOKEN" | "FEISHU_ENCRYPT_KEY">;
   logger: Logger;
 }
@@ -43,6 +43,10 @@ export const handleFeishuApprovalWebhook = async (
     if (!event) {
       deps.logger.info({ eventType: payload.header?.event_type ?? payload.type }, "Ignored non approval event");
       return { status: 200, body: { ok: true, ignored: true } };
+    }
+
+    if (event.status && deps.auditService.recordStatus) {
+      await deps.auditService.recordStatus(event.instanceCode, event.status);
     }
 
     if (!shouldAuditApprovalStatus(event.status)) {
@@ -74,7 +78,7 @@ export const handleFeishuApprovalWebhook = async (
 };
 
 export const createFeishuWebhookRouter = (deps: {
-  auditService: ApprovalAuditService | AuditServiceLike;
+  auditService: AuditServiceLike;
   config: Pick<AppEnv, "FEISHU_VERIFICATION_TOKEN" | "FEISHU_ENCRYPT_KEY">;
   logger: Logger;
 }): Router => {

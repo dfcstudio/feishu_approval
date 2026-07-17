@@ -1,8 +1,18 @@
 import { describe, expect, it } from "vitest";
 import { extractPaymentFields } from "../src/services/ocr/MockOCRProvider.js";
-import { extractResponseText, normalizeOcrJson } from "../src/services/ocr/OpenAIVisionOCRProvider.js";
+import { extractResponseText, normalizeOcrJson, toDataUrl } from "../src/services/ocr/OpenAIVisionOCRProvider.js";
+import { sanitizeDatabaseText } from "../src/utils/databaseText.js";
 
 describe("OCR fallback extraction", () => {
+  it("preserves native PDF MIME data for GLM-OCR layout parsing", () => {
+    expect(toDataUrl(Buffer.from("%PDF-1.7"), "application/pdf"))
+      .toBe("data:application/pdf;base64,JVBERi0xLjc=");
+  });
+
+  it("removes PostgreSQL-incompatible NUL characters from OCR text", () => {
+    expect(sanitizeDatabaseText("价税\u0000合计：17.47")).toBe("价税合计：17.47");
+  });
+
   it("extracts payment fields from raw text", () => {
     const result = extractPaymentFields([
       "支付金额：¥88.60",
@@ -16,6 +26,18 @@ describe("OCR fallback extraction", () => {
     expect(result.paidAt).toBe("2026-07-01 12:03:04");
     expect(result.payee).toBe("测试商户");
     expect(result.confidence).toBeGreaterThan(0);
+  });
+
+  it("uses the actual-paid amount in shopping order screenshots with an invoice-details action", () => {
+    const amounts = [
+      "¥20.4实付¥19.38（免运费）",
+      "¥18.6 ¥实付 ¥17.67（免运费）",
+      "¥5.1实付¥2.1（免运费）",
+      "¥5.1 ¥实付 ¥0.1（免运费）",
+      "¥63实付¥56.85（免运费）",
+    ].map((line) => extractPaymentFields(`交易成功\n${line}\n发票详情`).amount);
+
+    expect(amounts).toEqual(["19.38", "17.67", "2.10", "0.10", "56.85"]);
   });
 
   it("extracts fields from GLM-OCR payment markdown", () => {
@@ -33,6 +55,29 @@ describe("OCR fallback extraction", () => {
     expect(result.transactionId).toBe("4200003089202606096187571133");
     expect(result.paidAt).toBe("2026-6-9 02:26:35");
     expect(result.payee).toBe("新城吾悦商业管理集团有限公司上海分公司");
+  });
+
+  it("uses the tax-inclusive invoice total instead of the pre-tax amount", () => {
+    const result = extractPaymentFields([
+      "增值税电子普通发票",
+      "金额 16.48  税率 6%  税额 0.99",
+      "价税合计（大写）壹拾柒元肆角柒分",
+      "价税合计（小写）：¥17.47",
+    ].join("\n"));
+
+    expect(result.amount).toBe("17.47");
+  });
+
+  it("does not use a pre-tax invoice amount when the tax-inclusive total is unreadable", () => {
+    const result = extractPaymentFields("增值税发票\n金额：16.48\n税额：0.99\n价税合计：无法识别");
+
+    expect(result.amount).toBeUndefined();
+  });
+
+  it("reconstructs the tax-inclusive total from explicit pre-tax amount and tax", () => {
+    const result = extractPaymentFields("增值税发票\n不含税金额：16.48\n税额：0.99\n价税合计：模糊");
+
+    expect(result.amount).toBe("17.47");
   });
 
   it("normalizes AI OCR JSON output", () => {

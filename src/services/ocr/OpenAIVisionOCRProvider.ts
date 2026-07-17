@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import sharp from "sharp";
 import { z } from "zod";
 import type { AppEnv } from "../../config/env.js";
 import { AppError } from "../../utils/errors.js";
@@ -74,23 +75,80 @@ export class AIVisionOCRProvider implements OCRProvider {
       return extractPaymentFieldsFromTextFallback(input);
     }
 
-    const visionInput = mimeType === "application/pdf"
-      ? { buffer: await convertPdfToPng(input.fileBuffer), mimeType: "image/png" }
-      : { buffer: input.fileBuffer, mimeType };
+    // GLM-OCR accepts native PDFs (up to 100 pages). Keep the original document
+    // here so layout_parsing can inspect every page instead of rasterizing only
+    // the first page. Other vision APIs still receive a rasterized PDF.
+    const visionInput = isGlmOcr(this.config) || mimeType !== "application/pdf"
+      ? { buffer: input.fileBuffer, mimeType }
+      : { buffer: await convertPdfToPng(input.fileBuffer), mimeType: "image/png" };
     const dataUrl = toDataUrl(visionInput.buffer, visionInput.mimeType);
 
     if (isGlmOcr(this.config)) {
-      const response = await postWithOcrErrorHandling(() =>
-        this.http.post<VisionModelResponse>("/layout_parsing", {
-          model: this.config.AI_VISION_MODEL.toLowerCase(),
-          file: dataUrl,
-        }),
-      );
-      const rawText = response.data.md_results?.trim();
-      if (!rawText) {
-        throw new AppError("GLM-OCR response did not contain md_results", "AI_OCR_EMPTY_RESPONSE", 502);
+      const recognizeLayout = async (buffer: Buffer, inputMimeType: string): Promise<string> => {
+        const response = await postWithOcrErrorHandling(() =>
+          this.http.post<VisionModelResponse>("/layout_parsing", {
+            model: this.config.AI_VISION_MODEL.toLowerCase(),
+            file: toDataUrl(buffer, inputMimeType),
+          }),
+        );
+        const rawText = response.data.md_results?.trim();
+        if (!rawText) {
+          throw new AppError("GLM-OCR response did not contain md_results", "AI_OCR_EMPTY_RESPONSE", 502);
+        }
+        return rawText;
+      };
+
+      const rawText = await recognizeLayout(visionInput.buffer, visionInput.mimeType);
+      const firstResult = extractPaymentFields(rawText);
+      if (firstResult.amount) return firstResult;
+
+      // Retry failed documents as an enhanced image. PDFs are first rasterized
+      // only for this fallback; their primary OCR pass above remains multi-page.
+      const retrySource = visionInput.mimeType === "application/pdf"
+        ? await convertPdfToPng(visionInput.buffer)
+        : visionInput.buffer;
+      const enhancedBuffer = await enhanceForInvoiceOcr(retrySource);
+      const retryRawText = await recognizeLayout(enhancedBuffer, "image/png");
+      const retryResult = extractPaymentFields(retryRawText);
+      if (retryResult.amount || !this.config.AI_VISION_FALLBACK_MODEL.trim()) {
+        return {
+          ...retryResult,
+          rawText: `${rawText}\n\n--- OCR增强重试 ---\n${retryRawText}`,
+          confidence: retryResult.amount ? Math.max(retryResult.confidence, 0.7) : retryResult.confidence,
+        };
       }
-      return extractPaymentFields(rawText);
+
+      // A general vision model is better at semantic distinctions such as
+      // pre-tax amount vs. tax-inclusive total. Keep it as a best-effort third
+      // pass so an unavailable fallback never discards valid GLM-OCR text.
+      try {
+        const fallbackResponse = await postWithOcrErrorHandling(() =>
+          this.http.post<VisionModelResponse>("/chat/completions", {
+            model: this.config.AI_VISION_FALLBACK_MODEL,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: ocrPrompt },
+                { type: "image_url", image_url: { url: toDataUrl(enhancedBuffer, "image/png") } },
+              ],
+            }],
+            temperature: 0,
+          }),
+        );
+        const fallbackResult = normalizeOcrJson(extractResponseText(fallbackResponse.data));
+        return {
+          ...fallbackResult,
+          rawText: `${rawText}\n\n--- OCR增强重试 ---\n${retryRawText}\n\n--- 视觉模型复核 ---\n${fallbackResult.rawText}`,
+          confidence: fallbackResult.amount ? Math.max(fallbackResult.confidence, 0.75) : fallbackResult.confidence,
+        };
+      } catch {
+        // Preserve the primary OCR result when the optional fallback is unavailable.
+      }
+      return {
+        ...retryResult,
+        rawText: `${rawText}\n\n--- OCR增强重试 ---\n${retryRawText}`,
+        confidence: retryResult.amount ? Math.max(retryResult.confidence, 0.7) : retryResult.confidence,
+      };
     }
 
     const response = await retry(
@@ -286,8 +344,21 @@ const convertPdfToPng = async (pdfBuffer: Buffer): Promise<Buffer> => {
   }
 };
 
-const toDataUrl = (buffer: Buffer, mimeType?: string): string =>
+export const toDataUrl = (buffer: Buffer, mimeType?: string): string =>
   `data:${normalizeImageMimeType(mimeType)};base64,${buffer.toString("base64")}`;
+
+const enhanceForInvoiceOcr = async (buffer: Buffer): Promise<Buffer> => {
+  const image = sharp(buffer, { density: 220 }).rotate();
+  const metadata = await image.metadata();
+  const width = Math.min(4000, Math.max(1600, (metadata.width ?? 1000) * 2));
+  return image
+    .resize({ width, withoutEnlargement: false })
+    .grayscale()
+    .normalize()
+    .sharpen({ sigma: 1.2 })
+    .png()
+    .toBuffer();
+};
 
 const normalizeImageMimeType = (mimeType?: string): string => {
   if (mimeType?.startsWith("image/") || mimeType === "application/pdf") return mimeType;

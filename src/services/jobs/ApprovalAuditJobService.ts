@@ -6,6 +6,7 @@ import type { ApprovalAuditService } from "../approval/ApprovalAuditService.js";
 export class ApprovalAuditJobService {
   private timer?: NodeJS.Timeout;
   private running = false;
+  private activeRun?: Promise<boolean>;
   private readonly workerId = randomUUID();
   constructor(private readonly db: PrismaClient, private readonly processor: ApprovalAuditService,
     private readonly config: Pick<AppEnv, "AUDIT_WORKER_POLL_MS" | "AUDIT_JOB_LEASE_SECONDS" | "AUDIT_JOB_MAX_RETRIES">) {}
@@ -21,8 +22,19 @@ export class ApprovalAuditJobService {
     return { queued: true };
   }
 
-  start(): void { if (this.timer) return; const tick = () => void this.processNext().finally(() => { this.timer = setTimeout(tick, this.config.AUDIT_WORKER_POLL_MS); this.timer.unref(); }); tick(); }
+  async recordStatus(instanceCode: string, status: string): Promise<void> {
+    await this.db.approvalAuditRun.updateMany({
+      where: {
+        instanceCode,
+        OR: [{ requestedStatus: null }, { requestedStatus: { not: "APPROVED" } }],
+      },
+      data: { requestedStatus: status.toUpperCase() },
+    });
+  }
+
+  start(): void { if (this.timer || this.activeRun) return; const tick = () => { this.activeRun = this.processNext(); void this.activeRun.finally(() => { this.activeRun = undefined; if (!this.timer) return; this.timer = setTimeout(tick, this.config.AUDIT_WORKER_POLL_MS); this.timer.unref(); }).catch(() => undefined); }; this.timer = setTimeout(tick, 0); this.timer.unref(); }
   stop(): void { if (this.timer) clearTimeout(this.timer); this.timer = undefined; }
+  async stopAndWait(): Promise<void> { this.stop(); await this.activeRun; }
   async processNext(): Promise<boolean> {
     if (this.running) return false; this.running = true;
     try {

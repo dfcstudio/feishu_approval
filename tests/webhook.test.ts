@@ -110,6 +110,22 @@ describe("Feishu webhook", () => {
     expect(auditService.audit).toHaveBeenCalledWith("inst_approved", true, "APPROVED");
   });
 
+  it("records a rejected approval so it is excluded from future duplicate checks", async () => {
+    const auditService = { audit: vi.fn(), recordStatus: vi.fn().mockResolvedValue(undefined) };
+    const response = await handleFeishuApprovalWebhook(
+      {
+        token: "verify_token",
+        header: { event_type: "approval_instance_status_changed", token: "verify_token" },
+        event: { instance_code: "inst_rejected", status: "REJECTED" },
+      },
+      { config: testConfig, auditService, logger: testLogger },
+    );
+
+    expect(response.status).toBe(200);
+    expect(auditService.recordStatus).toHaveBeenCalledWith("inst_rejected", "REJECTED");
+    expect(auditService.audit).not.toHaveBeenCalled();
+  });
+
   it("decrypts encrypted callbacks before enqueue", async () => {
     const auditService = { audit: vi.fn().mockResolvedValue({ queued: true }) };
     const encryptKey = "test-encrypt-key";

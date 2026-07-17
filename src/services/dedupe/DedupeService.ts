@@ -2,6 +2,7 @@ import type { PrismaClient } from "@prisma/client";
 import { env } from "../../config/env.js";
 import { prisma } from "../../db/prisma.js";
 import { ImageHashService } from "./ImageHashService.js";
+import { moneyEquals } from "../../utils/money.js";
 
 export type DuplicateMatchType = "SHA256" | "PERCEPTUAL_HASH" | "TRANSACTION_ID" | "COMPOSITE";
 
@@ -10,6 +11,7 @@ export interface EvidenceSummary {
   instanceCode: string;
   applicantName?: string | null;
   approvalAmount?: unknown;
+  ocrAmount?: unknown;
   createdAt?: Date;
 }
 
@@ -22,23 +24,26 @@ export interface DuplicateMatchResult {
 
 export interface DedupeInput {
   currentEvidenceId: string;
+  instanceCode: string;
   sha256: string;
   transactionId?: string | null;
   perceptualHash?: string | null;
   approvalAmount: string;
+  ocrAmount?: string | null;
   paidAt?: Date | null;
   payee?: string | null;
 }
 
 export interface DedupeRepository {
-  findBySha256(sha256: string, excludeId: string): Promise<EvidenceSummary[]>;
-  findByTransactionId(transactionId: string, excludeId: string): Promise<EvidenceSummary[]>;
-  findWithPerceptualHash(excludeId: string): Promise<(EvidenceSummary & { perceptualHash?: string | null })[]>;
+  findBySha256(sha256: string, excludeId: string, excludeInstanceCode: string): Promise<EvidenceSummary[]>;
+  findByTransactionId(transactionId: string, excludeId: string, excludeInstanceCode: string): Promise<EvidenceSummary[]>;
+  findWithPerceptualHash(excludeId: string, excludeInstanceCode: string): Promise<(EvidenceSummary & { perceptualHash?: string | null })[]>;
   findByComposite(input: {
     approvalAmount: string;
     paidAt: Date;
     payee: string;
     excludeId: string;
+    excludeInstanceCode: string;
   }): Promise<EvidenceSummary[]>;
   createDuplicateMatches(currentEvidenceId: string, matches: DuplicateMatchResult[]): Promise<void>;
 }
@@ -46,25 +51,39 @@ export interface DedupeRepository {
 export class PrismaDedupeRepository implements DedupeRepository {
   constructor(private readonly client: PrismaClient = prisma) {}
 
-  async findBySha256(sha256: string, excludeId: string): Promise<EvidenceSummary[]> {
+  private async approvedInstanceCodes(excludeInstanceCode: string): Promise<string[]> {
+    const runs = await this.client.approvalAuditRun.findMany({
+      where: { requestedStatus: { equals: "APPROVED", mode: "insensitive" }, instanceCode: { not: excludeInstanceCode } },
+      select: { instanceCode: true },
+    });
+    return runs.map((run) => run.instanceCode);
+  }
+
+  async findBySha256(sha256: string, excludeId: string, excludeInstanceCode: string): Promise<EvidenceSummary[]> {
+    const approvedInstanceCodes = await this.approvedInstanceCodes(excludeInstanceCode);
+    if (!approvedInstanceCodes.length) return [];
     return this.client.paymentEvidence.findMany({
-      where: { sha256, id: { not: excludeId } },
+      where: { sha256, id: { not: excludeId }, instanceCode: { in: approvedInstanceCodes } },
       select: summarySelect,
       take: 20,
     });
   }
 
-  async findByTransactionId(transactionId: string, excludeId: string): Promise<EvidenceSummary[]> {
+  async findByTransactionId(transactionId: string, excludeId: string, excludeInstanceCode: string): Promise<EvidenceSummary[]> {
+    const approvedInstanceCodes = await this.approvedInstanceCodes(excludeInstanceCode);
+    if (!approvedInstanceCodes.length) return [];
     return this.client.paymentEvidence.findMany({
-      where: { transactionId, id: { not: excludeId } },
+      where: { transactionId, id: { not: excludeId }, instanceCode: { in: approvedInstanceCodes } },
       select: summarySelect,
       take: 20,
     });
   }
 
-  async findWithPerceptualHash(excludeId: string): Promise<(EvidenceSummary & { perceptualHash?: string | null })[]> {
+  async findWithPerceptualHash(excludeId: string, excludeInstanceCode: string): Promise<(EvidenceSummary & { perceptualHash?: string | null })[]> {
+    const approvedInstanceCodes = await this.approvedInstanceCodes(excludeInstanceCode);
+    if (!approvedInstanceCodes.length) return [];
     return this.client.paymentEvidence.findMany({
-      where: { perceptualHash: { not: null }, id: { not: excludeId } },
+      where: { perceptualHash: { not: null }, id: { not: excludeId }, instanceCode: { in: approvedInstanceCodes } },
       select: { ...summarySelect, perceptualHash: true },
       take: 500,
     });
@@ -75,7 +94,10 @@ export class PrismaDedupeRepository implements DedupeRepository {
     paidAt: Date;
     payee: string;
     excludeId: string;
+    excludeInstanceCode: string;
   }): Promise<EvidenceSummary[]> {
+    const approvedInstanceCodes = await this.approvedInstanceCodes(input.excludeInstanceCode);
+    if (!approvedInstanceCodes.length) return [];
     const start = new Date(input.paidAt);
     start.setHours(0, 0, 0, 0);
     const end = new Date(start);
@@ -84,6 +106,7 @@ export class PrismaDedupeRepository implements DedupeRepository {
     return this.client.paymentEvidence.findMany({
       where: {
         id: { not: input.excludeId },
+        instanceCode: { in: approvedInstanceCodes },
         approvalAmount: input.approvalAmount,
         paidAt: { gte: start, lt: end },
         payee: input.payee,
@@ -129,7 +152,7 @@ export class DedupeService {
       results.set(key, match);
     };
 
-    for (const matchedEvidence of await this.repository.findBySha256(input.sha256, input.currentEvidenceId)) {
+    for (const matchedEvidence of await this.repository.findBySha256(input.sha256, input.currentEvidenceId, input.instanceCode)) {
       add({ matchedEvidence, matchType: "SHA256", score: 1, reason: "原始文件 SHA-256 完全一致" });
     }
 
@@ -137,15 +160,21 @@ export class DedupeService {
       for (const matchedEvidence of await this.repository.findByTransactionId(
         input.transactionId,
         input.currentEvidenceId,
+        input.instanceCode,
       )) {
         add({ matchedEvidence, matchType: "TRANSACTION_ID", score: 1, reason: "交易流水号完全一致" });
       }
     }
 
     if (input.perceptualHash) {
-      const candidates = await this.repository.findWithPerceptualHash(input.currentEvidenceId);
+      const candidates = await this.repository.findWithPerceptualHash(input.currentEvidenceId, input.instanceCode);
       for (const candidate of candidates) {
         if (!candidate.perceptualHash) continue;
+        const currentAmount = input.ocrAmount ?? input.approvalAmount;
+        const candidateAmount = candidate.ocrAmount ?? candidate.approvalAmount;
+        if (candidateAmount === null || candidateAmount === undefined || !moneyEquals(currentAmount, String(candidateAmount))) {
+          continue;
+        }
         const distance = this.imageHashService.hammingDistance(input.perceptualHash, candidate.perceptualHash);
         if (distance <= this.perceptualHashThreshold) {
           add({
@@ -164,6 +193,7 @@ export class DedupeService {
         paidAt: input.paidAt,
         payee: input.payee,
         excludeId: input.currentEvidenceId,
+        excludeInstanceCode: input.instanceCode,
       })) {
         add({
           matchedEvidence,
@@ -183,5 +213,6 @@ const summarySelect = {
   instanceCode: true,
   applicantName: true,
   approvalAmount: true,
+  ocrAmount: true,
   createdAt: true,
 } as const;

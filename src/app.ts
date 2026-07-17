@@ -32,29 +32,38 @@ export const logger = pino({
 export const createApp = (overrides?: {
   config?: AppEnv;
   auditService?: AuditServiceLike;
+}) => createApplication(overrides).app;
+
+export const createApplication = (overrides?: {
+  config?: AppEnv;
+  auditService?: AuditServiceLike;
 }) => {
   const config = overrides?.config ?? env;
   const app = express();
   app.use(express.json({ limit: "2mb" }));
   app.use(pinoHttp({ logger }));
 
-  const auditService =
-    overrides?.auditService ??
-    (() => {
+  let jobs: ApprovalAuditJobService | undefined;
+  let notifyService: FeishuNotifyService | undefined;
+  let outboxTimer: NodeJS.Timeout | undefined;
+  const auditService = overrides?.auditService ?? (() => {
       const feishuClient = new FeishuClient(config);
-      const notifyService = new FeishuNotifyService(feishuClient, config, prisma);
-      const outboxTimer = setInterval(() => void notifyService.processNext(), config.AUDIT_WORKER_POLL_MS);
+      notifyService = new FeishuNotifyService(feishuClient, config, prisma);
+      outboxTimer = setInterval(() => void notifyService!.processNext().catch((error) => {
+        logger.error({ error }, "Notification outbox poll failed");
+      }), config.AUDIT_WORKER_POLL_MS);
       outboxTimer.unref();
       const processor = new ApprovalAuditService({
         feishuClient,
         ocrProvider: createOCRProvider(config),
         storageProvider: new LocalStorageProvider(config.LOCAL_STORAGE_DIR),
+        reviewStorageProvider: new LocalStorageProvider(config.OCR_REVIEW_DIR),
         dedupeService: new DedupeService(),
         notifyService,
         db: prisma,
         config,
       });
-      const jobs = new ApprovalAuditJobService(prisma, processor, config);
+      jobs = new ApprovalAuditJobService(prisma, processor, config);
       jobs.start();
       return jobs;
     })();
@@ -69,7 +78,19 @@ export const createApp = (overrides?: {
     }),
   );
 
-  return app;
+  let shutdownPromise: Promise<void> | undefined;
+  const stop = (): void => {
+    if (outboxTimer) clearInterval(outboxTimer);
+    outboxTimer = undefined;
+    jobs?.stop();
+  };
+  const shutdown = (): Promise<void> => shutdownPromise ??= (async () => {
+    stop();
+    await Promise.all([jobs?.stopAndWait(), notifyService?.waitForIdle()]);
+    if (!overrides?.auditService) await prisma.$disconnect();
+  })();
+
+  return { app, stop, shutdown };
 };
 
 const createOCRProvider = (config: AppEnv): OCRProvider => {

@@ -56,6 +56,8 @@ model PaymentEvidence {
   instanceCode     String
   fileToken        String?
   documentType     String    @default("PAYMENT")
+  invoiceBuyerName String?
+  invoiceTitleMatched Boolean?
   applicantId      String?
   applicantName    String?
   approvalName     String?
@@ -73,6 +75,8 @@ model PaymentEvidence {
   perceptualHash   String?
   ocrRawText       String?
   ocrConfidence    Float
+  ocrConfidenceScore Int
+  ocrReviewStorageKey String?
   riskLevel        RiskLevel
   riskReasons      Json
   processingStatus String    @default("COMPLETE")
@@ -102,6 +106,7 @@ model ApprovalAuditSummary {
   invoiceRecognizedCount Int       @default(0)
   invoiceTotal           Decimal?  @db.Decimal(18, 2)
   invoiceTotalMatched    Boolean?
+  supportingDocumentCount Int      @default(0)
   riskLevel              RiskLevel
   riskReasons            Json
   createdAt              DateTime  @default(now())

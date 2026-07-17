@@ -23,6 +23,7 @@ export interface ParsedApprovalForm {
   applicantId?: string | null;
   applicantName?: string | null;
   approvalAmount: string;
+  receivingUnit?: string;
   attachments: NormalizedAttachment[];
   handlerOpenIds: string[];
   applicantDepartmentIds: string[];

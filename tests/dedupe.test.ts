@@ -20,7 +20,7 @@ class FakeDedupeRepository implements DedupeRepository {
   }
 
   async findWithPerceptualHash(): Promise<(EvidenceSummary & { perceptualHash?: string | null })[]> {
-    return [];
+    return this.evidence.filter((item) => "perceptualHash" in item) as (EvidenceSummary & { perceptualHash?: string | null })[];
   }
 
   async findByComposite(): Promise<EvidenceSummary[]> {
@@ -38,6 +38,7 @@ describe("DedupeService", () => {
     const service = new DedupeService(repo);
     const matches = await service.findAndPersistMatches({
       currentEvidenceId: "current",
+      instanceCode: "current_instance",
       sha256: "abc",
       approvalAmount: "10.00",
     });
@@ -51,11 +52,26 @@ describe("DedupeService", () => {
     const service = new DedupeService(repo);
     const matches = await service.findMatches({
       currentEvidenceId: "current",
+      instanceCode: "current_instance",
       sha256: "abc",
       transactionId: "TX123456",
       approvalAmount: "10.00",
     });
 
     expect(matches).toEqual([expect.objectContaining({ matchType: "TRANSACTION_ID" })]);
+  });
+
+  it("does not flag similar layouts when OCR amounts differ", async () => {
+    const repo = new FakeDedupeRepository([{
+      id: "similar_layout", instanceCode: "old_3", perceptualHash: "0000000000000000",
+      approvalAmount: "92.80", ocrAmount: "239.46",
+    } as EvidenceSummary & { perceptualHash: string }]);
+    const service = new DedupeService(repo);
+    const matches = await service.findMatches({
+      currentEvidenceId: "current", instanceCode: "current_instance", sha256: "new",
+      perceptualHash: "0000000000000000", approvalAmount: "15.00", ocrAmount: "15.00",
+    });
+
+    expect(matches).toEqual([]);
   });
 });

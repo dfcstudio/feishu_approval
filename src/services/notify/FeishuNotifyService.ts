@@ -4,6 +4,7 @@ import type { DuplicateMatchResult } from "../dedupe/DedupeService.js";
 import type { Prisma, PrismaClient, RiskLevel } from "@prisma/client";
 import type { ApprovalApprover } from "../feishu/feishuTypes.js";
 import { NotificationRouter, type NotificationRecipient } from "./NotificationRouter.js";
+import { isLikelyUserId } from "../../utils/userIdentity.js";
 
 export interface AuditNotificationInput {
   serialNumber?: string | null;
@@ -27,7 +28,10 @@ export interface AuditNotificationInput {
   documentSummary?: {
     paymentDocumentCount: number; paymentRecognizedCount: number; paymentTotal?: string | null; paymentTotalMatched?: boolean | null;
     invoiceDocumentCount: number; invoiceRecognizedCount: number; invoiceTotal?: string | null; invoiceTotalMatched?: boolean | null;
+    supportingDocumentCount?: number;
   };
+  notificationStage?: "AUDIT" | "APPROVED_HANDOFF";
+  ocrConfidenceScore?: number;
 }
 
 const RISK_CN: Record<string, string> = {
@@ -40,6 +44,23 @@ const RISK_CN: Record<string, string> = {
   FIELD_PARSE_FAILED: "审批字段解析失败",
   AI_OCR_SCHEMA_INVALID: "AI OCR返回格式异常",
   AI_OCR_EMPTY_RESPONSE: "AI OCR返回空内容",
+  OCR_PROCESSING_FAILED: "部分附件OCR处理失败",
+  PAYMENT_TOTAL_MISMATCH: "付款凭证合计与费用明细合计不一致",
+  PAYMENT_AMOUNT_INCOMPLETE: "部分付款凭证金额未识别",
+  INVOICE_TOTAL_MISMATCH: "发票合计与费用明细合计不一致",
+  INVOICE_AMOUNT_INCOMPLETE: "部分发票金额未识别",
+  INVOICE_TITLE_MISMATCH: "发票抬头与收票/报销单位不一致",
+  INVOICE_BUYER_NOT_FOUND: "未识别发票购买方抬头",
+  APPROVAL_RECEIVING_UNIT_NOT_FOUND: "审批单未找到收票/报销单位",
+  VALID_EVIDENCE_NOT_FOUND: "未找到可计入金额的有效付款或发票凭证",
+  OCR_CONFIDENCE_SCORE_1: "OCR置信度1/5，已转人工复核",
+};
+
+const RISK_LEVEL_CN: Record<string, string> = {
+  HIGH: "高风险",
+  MEDIUM: "中风险",
+  LOW: "低风险",
+  UNKNOWN: "风险未知",
 };
 
 const RISK_COLORS: Record<string, string> = {
@@ -64,6 +85,7 @@ const riskEmoji = (level: string): string => {
 
 export class FeishuNotifyService {
   private readonly router: NotificationRouter;
+  private activeRun?: Promise<boolean>;
   constructor(
     private readonly feishuClient: FeishuClient,
     private readonly config: Pick<
@@ -75,6 +97,17 @@ export class FeishuNotifyService {
 
   async sendAuditResult(input: AuditNotificationInput): Promise<void> {
     const approvalUrl = buildApprovalDetailUrl(input.instanceCode, this.config.FEISHU_APPROVAL_DETAIL_URL_TEMPLATE);
+    const applicantName = input.applicantName?.trim();
+    const unresolvedApplicantId = isLikelyUserId(applicantName)
+      ? applicantName
+      : input.applicantId?.trim();
+    const applicantDisplayName = applicantName
+      && applicantName !== input.applicantId?.trim()
+      && !isLikelyUserId(applicantName)
+      ? applicantName
+      : unresolvedApplicantId
+        ? `${unresolvedApplicantId}（未识别姓名）`
+        : "未识别姓名";
     const elements: Record<string, unknown>[] = [
       {
         tag: "div",
@@ -83,9 +116,10 @@ export class FeishuNotifyService {
           content: [
             `**审批编号：**${input.serialNumber ?? input.instanceCode}`,
             `**审批单：**${input.approvalName ?? "未识别"}`,
-            `**报销人：**${input.applicantName ?? "未识别"}`,
+            `**报销人：**${applicantDisplayName}`,
             `**审批金额：**${input.approvalAmount}`,
             `**OCR 识别金额：**${input.ocrAmount ?? "未识别"}`,
+            `**OCR 置信度：**${input.ocrConfidenceScore ? `${input.ocrConfidenceScore}/5` : "未评分"}`,
             `**金额核对：**${formatAmountMatched(input.amountMatched)}`,
           ].join("\n"),
         },
@@ -108,7 +142,7 @@ export class FeishuNotifyService {
         text: {
           tag: "lark_md",
           content: [
-            `**风险等级：**${riskEmoji(input.riskLevel)} ${input.riskLevel}`,
+            `**风险等级：**${riskEmoji(input.riskLevel)} ${RISK_LEVEL_CN[input.riskLevel] ?? "风险未知"}`,
             `**风险原因：**${
               input.riskReasons.length ? input.riskReasons.map((reason) => RISK_CN[reason] ?? reason).join(", ") : "无"
             }`,
@@ -122,6 +156,7 @@ export class FeishuNotifyService {
       elements.push({ tag: "hr" }, { tag: "div", text: { tag: "lark_md", content: [
         `**付款凭证汇总：**${s.paymentRecognizedCount}/${s.paymentDocumentCount} 张，合计 ${s.paymentTotal ?? "无法计算"}，${formatSummaryMatched(s.paymentTotalMatched)}`,
         `**发票汇总：**${s.invoiceRecognizedCount}/${s.invoiceDocumentCount} 张，合计 ${s.invoiceTotal ?? "无法计算"}，${formatSummaryMatched(s.invoiceTotalMatched)}`,
+        `**佐证材料：**${s.supportingDocumentCount ?? 0} 张（不计入金额与查重）`,
       ].join("\n") } });
     }
 
@@ -184,7 +219,12 @@ export class FeishuNotifyService {
     const card = {
       config: { wide_screen_mode: true },
       header: {
-        title: { tag: "plain_text", content: `报销辅助审核 ${riskEmoji(input.riskLevel)}` },
+        title: {
+          tag: "plain_text",
+          content: input.notificationStage === "APPROVED_HANDOFF"
+            ? `审批通过 · 待办理 ${riskEmoji(input.riskLevel)}`
+            : `报销辅助审核 ${riskEmoji(input.riskLevel)}`,
+        },
         template: RISK_COLORS[input.riskLevel] ?? "grey",
       },
       elements,
@@ -302,7 +342,16 @@ export class FeishuNotifyService {
       });
   }
 
-  async processNext(): Promise<boolean> {
+  processNext(): Promise<boolean> {
+    if (this.activeRun) return Promise.resolve(false);
+    this.activeRun = this.processNextItem();
+    void this.activeRun.finally(() => { this.activeRun = undefined; }).catch(() => undefined);
+    return this.activeRun;
+  }
+
+  async waitForIdle(): Promise<void> { await this.activeRun; }
+
+  private async processNextItem(): Promise<boolean> {
     if (!this.db) return false;
     const now = new Date();
     const item = await this.db.notificationOutbox.findFirst({ where: { OR: [

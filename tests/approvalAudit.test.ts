@@ -38,64 +38,7 @@ describe("ApprovalAuditService", () => {
     expect(notifyService.sendAuditResult).not.toHaveBeenCalled();
   });
 
-  it("reuses cached OCR data for APPROVED and notifies handlers once", async () => {
-    const cachedEvidence = {
-      id: "cached_1",
-      approvalName: null,
-      applicantName: "张三",
-      approvalAmount: { toString: () => "10.00" },
-      ocrAmount: { toString: () => "10.00" },
-      amountMatched: true,
-      transactionId: "txn_1",
-      paidAt: new Date("2026-07-10T10:00:00+08:00"),
-      payee: "测试商户",
-      riskLevel: "LOW",
-      riskReasons: [],
-    };
-    const db = {
-      paymentEvidence: { findFirst: vi.fn().mockResolvedValue(cachedEvidence) },
-      approvalAuditRun: { findUnique: vi.fn().mockResolvedValue({ approvedNotifiedAt: null }), update: vi.fn() },
-    } as unknown as PrismaClient;
-    const feishuClient = {
-      getApprovalInstanceDetail: vi.fn().mockResolvedValue({
-        instanceCode: "inst_cached",
-        approvalCode: "CB1E3C0E-073F-4C01-A6D1-6EBF27207BBB",
-        submitterOpenId: "ou_submitter",
-        approverOpenIds: ["ou_approver"],
-        form: [{ name: "办理人", value: [{ open_id: "ou_handler" }] }],
-        raw: {},
-      }),
-      downloadApprovalFile: vi.fn(),
-    };
-    const notifyService = { sendAuditResult: vi.fn().mockResolvedValue(undefined) };
-    const ocrProvider = { recognizePaymentEvidence: vi.fn() };
-
-    const service = new ApprovalAuditService({
-      db,
-      config: testConfig,
-      feishuClient: feishuClient as never,
-      storageProvider: {} as never,
-      ocrProvider: ocrProvider as never,
-      dedupeService: {} as never,
-      notifyService: notifyService as never,
-    });
-
-    const result = await service.audit("inst_cached", true, "APPROVED");
-
-    expect(result).toEqual({ skipped: true, evidenceIds: ["cached_1"] });
-    expect(ocrProvider.recognizePaymentEvidence).not.toHaveBeenCalled();
-    expect(feishuClient.downloadApprovalFile).not.toHaveBeenCalled();
-    expect(notifyService.sendAuditResult).toHaveBeenCalledWith(expect.objectContaining({
-      approvalName: "费用报销（有票）",
-      extraRecipientOpenIds: ["ou_handler"],
-    }));
-    expect(db.approvalAuditRun.update).toHaveBeenCalledWith({
-      where: { instanceCode: "inst_cached" },
-      data: { approvedNotifiedAt: expect.any(Date) },
-    });
-  });
-
-  it("backfills original file storage for an approved approval without creating duplicate evidence", async () => {
+  it("seals an approved audit after notifying handlers even when an ancillary notification warns", async () => {
     const db = {
       approvalAuditRun: {
         findUnique: vi.fn().mockResolvedValue({ instanceCode: "inst_1", status: "SUCCESS" }),
@@ -119,7 +62,7 @@ describe("ApprovalAuditService", () => {
     const notifyService = {
       sendAuditResult: vi.fn(),
       sendManualReviewWarning: vi.fn(),
-      sendOriginalFileSaved: vi.fn(),
+      sendOriginalFileSaved: vi.fn().mockRejectedValue(new Error("saved notice failed")),
     };
 
     const service = new ApprovalAuditService({
@@ -131,6 +74,7 @@ describe("ApprovalAuditService", () => {
           form: [
             { name: "报销金额", value: "10.00" },
             { name: "付款凭证", value: [{ file_token: "file_1", name: "pay.png", mime_type: "image/png" }] },
+            { name: "办理人", value: [{ open_id: "ou_handler" }] },
           ],
           raw: {},
         }),
@@ -143,14 +87,26 @@ describe("ApprovalAuditService", () => {
       notifyService: notifyService as never,
     });
 
-    const result = await service.audit("inst_1", true);
+    const result = await service.audit("inst_1", true, "APPROVED");
 
-    expect(result).toEqual({ skipped: false, evidenceIds: ["evidence_1"] });
+    expect(result).toEqual({
+      skipped: false,
+      evidenceIds: ["evidence_1"],
+      warning: "Notification failed: saved notice failed",
+    });
     expect(storageProvider.save).toHaveBeenCalledOnce();
     expect(db.paymentEvidence.create).not.toHaveBeenCalled();
     expect(ocrProvider.recognizePaymentEvidence).not.toHaveBeenCalled();
     expect(dedupeService.findAndPersistMatches).not.toHaveBeenCalled();
     expect(notifyService.sendAuditResult).toHaveBeenCalledOnce();
+    expect(notifyService.sendAuditResult).toHaveBeenCalledWith(expect.objectContaining({
+      notificationKey: "audit-approved:inst_1",
+      notificationStage: "APPROVED_HANDOFF",
+      applicantId: undefined,
+      currentApprovers: [],
+      extraRecipientOpenIds: ["ou_handler"],
+      documentSummary: expect.objectContaining({ paymentDocumentCount: 1 }),
+    }));
     expect(notifyService.sendOriginalFileSaved).toHaveBeenCalledWith({
       serialNumber: undefined,
       instanceCode: "inst_1",
@@ -162,6 +118,13 @@ describe("ApprovalAuditService", () => {
       data: expect.objectContaining({
         storageKey: "2026-07-09/file.png",
         perceptualHash: "phash",
+      }),
+    });
+    expect(db.approvalAuditRun.update).toHaveBeenLastCalledWith({
+      where: { instanceCode: "inst_1" },
+      data: expect.objectContaining({
+        status: "SUCCESS_WITH_WARNING",
+        approvedNotifiedAt: expect.any(Date),
       }),
     });
   });
@@ -259,6 +222,7 @@ describe("ApprovalAuditService", () => {
           form: [
             { name: "报销金额", value: "10.00" },
             { name: "付款凭证", value: [{ file_token: "file_4", name: "pay.png", mime_type: "image/png" }] },
+            { name: "报销人", value: "7b8afdbb" },
           ],
           raw: {},
         }),

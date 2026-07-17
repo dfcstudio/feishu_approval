@@ -41,6 +41,29 @@ describe("parseApprovalForm", () => {
     expect(parsed.handlerOpenIds).toEqual([]);
   });
 
+  it("does not treat a bare personnel id as an applicant name", () => {
+    const parsed = parseApprovalForm({
+      instanceCode: "inst_person_id",
+      applicantId: "ou_real_applicant",
+      applicantName: "ou_real_applicant",
+      form: [
+        { name: "报销金额", value: "10.00" },
+        { name: "付款凭证", value: [{ file_token: "file_person" }] },
+        { name: "报销人", value: "7b8afdbb" },
+      ],
+      raw: {},
+    }, {
+      APPROVAL_AMOUNT_FIELD_NAMES: ["报销金额"],
+      APPROVAL_ATTACHMENT_FIELD_NAMES: ["付款凭证"],
+      APPROVAL_INVOICE_FIELD_NAMES: ["发票"],
+      APPROVAL_APPLICANT_FIELD_NAMES: ["报销人"],
+      APPROVAL_HANDLER_FIELD_NAMES: ["办理人"],
+    });
+
+    expect(parsed.applicantId).toBe("ou_real_applicant");
+    expect(parsed.applicantName).toBe("ou_real_applicant");
+  });
+
   it("parses nested row fields and URL-only attachments", () => {
     const parsed = parseApprovalForm(
       {
@@ -110,5 +133,33 @@ describe("parseApprovalForm", () => {
     expect(parsed.approvalAmount).toBe("300.00");
     expect(parsed.attachments.filter((item) => item.documentType === "PAYMENT")).toHaveLength(2);
     expect(parsed.attachments.filter((item) => item.documentType === "INVOICE")).toHaveLength(2);
+  });
+
+  it("sums expense-detail rows and collects all image and attachment controls", () => {
+    const images = Array.from({ length: 20 }, (_, index) => ({ file_token: `image_${index + 1}` }));
+    const parsed = parseApprovalForm({ instanceCode: "real_shape", form: [
+      { name: "费用明细", value: [
+        [{ name: "金额", value: 92.8 }],
+        [{ name: "金额", value: 107.34 }],
+      ] },
+      { name: "分摊明细（分摊合计=费用明细合计）", value: [[{ name: "金额", value: 200.14 }]] },
+      { name: "图片/视频", value: images },
+      { name: "附件", value: [
+        { file_token: "invoice_1", name: "invoice-1.pdf", mime_type: "application/pdf" },
+        { file_token: "invoice_2", name: "invoice-2.pdf", mime_type: "application/pdf" },
+        { file_token: "expense_excel", name: "费用明细.xlsx", mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+        { file_token: "expense_csv", name: "费用明细.csv", mime_type: "text/csv" },
+      ] },
+    ], raw: {} }, {
+      APPROVAL_AMOUNT_FIELD_NAMES: ["费用明细汇总", "报销金额", "金额", "实付金额"],
+      APPROVAL_ATTACHMENT_FIELD_NAMES: ["图片/视频", "图片"], APPROVAL_INVOICE_FIELD_NAMES: ["附件"],
+      APPROVAL_APPLICANT_FIELD_NAMES: ["报销人"], APPROVAL_HANDLER_FIELD_NAMES: ["办理人"],
+    });
+
+    expect(parsed.approvalAmount).toBe("200.14");
+    expect(parsed.attachments.filter((item) => item.documentType === "PAYMENT")).toHaveLength(20);
+    expect(parsed.attachments.filter((item) => item.documentType === "INVOICE")).toHaveLength(2);
+    expect(parsed.attachments.map((item) => item.fileToken)).not.toContain("expense_excel");
+    expect(parsed.attachments.map((item) => item.fileToken)).not.toContain("expense_csv");
   });
 });

@@ -25,6 +25,34 @@ describe("buildApprovalDetailUrl", () => {
 });
 
 describe("FeishuNotifyService recipients", () => {
+  it("renders applicant and risk information in Chinese without exposing an applicant id as a name", async () => {
+    const feishuClient = { sendInteractiveCard: vi.fn().mockResolvedValue(undefined) };
+    const service = new FeishuNotifyService(feishuClient as never, {
+      FEISHU_NOTIFY_RECEIVE_ID_TYPE: "open_id",
+      FEISHU_NOTIFY_RECEIVE_ID: "ou_configured",
+      FEISHU_APPROVAL_DETAIL_URL_TEMPLATE: "https://app.feishu.cn/approval/detail?instance_code=",
+    });
+
+    await service.sendAuditResult({
+      instanceCode: "inst_zh",
+      applicantId: "7b8afdbb",
+      applicantName: "7b8afdbb",
+      approvalAmount: "389.44",
+      amountMatched: false,
+      riskLevel: "MEDIUM",
+      riskReasons: ["PAYMENT_TOTAL_MISMATCH"],
+      duplicateMatches: [],
+    });
+
+    const card = feishuClient.sendInteractiveCard.mock.calls[0][0].card as {
+      elements: Array<{ text?: { content?: string } }>;
+    };
+    const content = card.elements.flatMap((element) => element.text?.content ?? []).join("\n");
+    expect(content).toContain("报销人：**7b8afdbb（未识别姓名）");
+    expect(content).toContain("风险等级：**🟡 中风险");
+    expect(content).toContain("风险原因：**付款凭证合计与费用明细合计不一致");
+  });
+
   it("sends the card once to each additional open_id", async () => {
     const feishuClient = { sendInteractiveCard: vi.fn().mockResolvedValue(undefined) };
     const service = new FeishuNotifyService(feishuClient as never, {

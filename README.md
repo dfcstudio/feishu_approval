@@ -47,13 +47,17 @@ POST /webhooks/feishu/approval
 | `FEISHU_NOTIFY_RECEIVE_ID` | 机器人消息接收人或群 ID |
 | `FEISHU_APPROVAL_DETAIL_URL_TEMPLATE` | 通知卡片“查看审批详情”链接模板；支持 `{instanceCode}` 占位符 |
 | `APPLICANT_NAME_MAP` | 报销人 ID 到姓名的临时映射，格式：`42cg4661:张三,9fc48b7a:李四` |
+| `AI_VISION_MODEL` | 主 OCR 模型；GLM 文档识别建议使用 `GLM-OCR` |
+| `AI_VISION_FALLBACK_MODEL` | GLM-OCR 未提取到金额时使用的视觉复核模型，默认 `glm-4.6v-flash` |
 | `APPROVAL_AMOUNT_FIELD_NAMES` | 金额字段候选名称，逗号分隔 |
 | `APPROVAL_ATTACHMENT_FIELD_NAMES` | 凭证/截图字段候选名称，逗号分隔 |
+| `APPROVAL_INVOICE_FIELD_NAMES` | 发票附件字段候选名称，逗号分隔 |
 | `APPROVAL_APPLICANT_FIELD_NAMES` | 申请人/报销人字段候选名称，逗号分隔 |
 | `APPROVAL_HANDLER_FIELD_NAMES` | 审批通过后接收结果的办理人人员控件名称，逗号分隔 |
 | `LOCAL_STORAGE_DIR` | 本地凭证保存目录；后续可替换为 S3 Provider |
 | `SAVE_ORIGINAL_FILE` | 是否保存原始付款凭证 |
 | `SAVE_OCR_RAW_TEXT` | 是否保存 OCR 原文 |
+| `OCR_REVIEW_DIR` | OCR 置信度为 1/5 的附件复核目录，默认 `./data/approval/ocr-review` |
 | `PERCEPTUAL_HASH_DISTANCE_THRESHOLD` | 图片感知 hash 判重阈值 |
 
 ## 飞书开放平台配置
@@ -111,7 +115,8 @@ FEISHU_APPROVAL_DETAIL_URL_TEMPLATE=https://applink.feishu.cn/client/mini_progra
 
 ```env
 APPROVAL_AMOUNT_FIELD_NAMES=报销金额,金额,实付金额
-APPROVAL_ATTACHMENT_FIELD_NAMES=付款凭证,支付截图,报销凭证,附件
+APPROVAL_ATTACHMENT_FIELD_NAMES=付款凭证,支付截图,报销凭证,图片/视频,图片
+APPROVAL_INVOICE_FIELD_NAMES=发票,发票附件,电子发票,发票图片,附件
 APPROVAL_APPLICANT_FIELD_NAMES=申请人,报销人
 APPROVAL_HANDLER_FIELD_NAMES=办理人,经办人,付款办理人
 ```
@@ -241,3 +246,11 @@ npm test
 ```
 
 已覆盖金额解析、OCR fallback、审批表单解析、SHA-256 查重、交易号查重、金额不一致风险、webhook challenge 和 webhook 幂等入口。
+
+队列认领和租约恢复另有 PostgreSQL 集成测试。请提供一个已经执行本项目 Prisma migrations、且仅供测试使用的数据库：
+
+```bash
+TEST_DATABASE_URL=postgresql://... npm run test:integration
+```
+
+普通 `npm test` 在未设置 `TEST_DATABASE_URL` 时会跳过这组测试，不会连接或清理开发/生产数据库。

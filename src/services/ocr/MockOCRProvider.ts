@@ -1,4 +1,4 @@
-import { normalizeMoney } from "../../utils/money.js";
+import { centsToDecimal, decimalToCents, normalizeMoney } from "../../utils/money.js";
 import type { OCRProvider, PaymentOCRResult } from "./OCRProvider.js";
 
 export class MockOCRProvider implements OCRProvider {
@@ -27,8 +27,32 @@ export const extractPaymentFields = (rawText: string): PaymentOCRResult => {
 };
 
 const extractAmount = (text: string): string | undefined => {
+  const invoiceTotalPatterns = [
+    /价税合计(?:\s*[（(]\s*小写\s*[）)])?[\s|:：]*[（(]?\s*(?:人民币)?\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/iu,
+    /(?:含税合计|(?<!不)含税金额)[\s|:：]*\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/iu,
+    /[（(]\s*小写\s*[）)][\s|:：]*\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/iu,
+  ];
+  for (const pattern of invoiceTotalPatterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return normalizeMoney(match[1]);
+  }
+
+  const preTax = text.match(/不含税金额[\s|:：]*\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/iu)?.[1];
+  const tax = text.match(/税额[\s|:：]*\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/iu)?.[1];
+  if (preTax && tax) {
+    return centsToDecimal(decimalToCents(normalizeMoney(preTax)) + decimalToCents(normalizeMoney(tax)));
+  }
+
+  // An invoice subtotal is not reimbursable total. If the document looks like an
+  // invoice but its tax-inclusive total is unreadable, report no amount instead
+  // of incorrectly falling back to “金额/不含税金额”.
+  // A shopping-order screenshot may contain an “发票详情” action without being
+  // an invoice. Only suppress generic amount fallback for strong invoice fields.
+  if (/(?:增值税.{0,8}发票|发票(?:号码|代码)|税额|税率|购买方|销售方|价税合计)/u.test(text)) return undefined;
+
   const patterns = [
-    /(?:实付|支付|付款|金额|合计|total|amount)\s*[:：]?\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*(?:元)?/i,
+    /实付\s*[:：]?\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*(?:元)?/i,
+    /(?:支付|付款|金额|合计|total|amount)\s*[:：]?\s*(?:RMB|CNY|[￥¥])?\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*(?:元)?/i,
     /(?:RMB|CNY|[￥¥])\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)/i,
     /(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2})?|-?\d+(?:\.\d{1,2})?)\s*元/,
     /^\s*(-?\d{1,9}(?:[,.]\d{3})*(?:\.\d{1,2}))\s*$/m,

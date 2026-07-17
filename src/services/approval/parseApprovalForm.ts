@@ -1,6 +1,7 @@
 import type { AppEnv } from "../../config/env.js";
 import { BusinessError } from "../../utils/errors.js";
-import { normalizeMoney } from "../../utils/money.js";
+import { centsToDecimal, decimalToCents, normalizeMoney } from "../../utils/money.js";
+import { isLikelyUserId } from "../../utils/userIdentity.js";
 import type {
   FeishuApprovalInstanceDetail,
   NormalizedAttachment,
@@ -23,16 +24,17 @@ export const parseApprovalForm = (
     | "APPROVAL_INVOICE_FIELD_NAMES"
     | "APPROVAL_APPLICANT_FIELD_NAMES"
     | "APPROVAL_HANDLER_FIELD_NAMES"
-  >,
+  > & Partial<Pick<AppEnv, "APPROVAL_RECEIVING_UNIT_FIELD_NAMES">>,
 ): ParsedApprovalForm => {
   const fields = normalizeFormFields(detail.form);
-  const amountField = findByNames(fields, config.APPROVAL_AMOUNT_FIELD_NAMES);
+  const approvalAmount = resolveApprovalAmount(fields, config.APPROVAL_AMOUNT_FIELD_NAMES);
   const paymentFields = findAllByNames(fields, config.APPROVAL_ATTACHMENT_FIELD_NAMES);
   const invoiceFields = findAllByNames(fields, config.APPROVAL_INVOICE_FIELD_NAMES);
   const applicantField = findByNames(fields, config.APPROVAL_APPLICANT_FIELD_NAMES);
   const handlerField = findByNames(fields, config.APPROVAL_HANDLER_FIELD_NAMES);
+  const receivingUnitField = findByNames(fields, config.APPROVAL_RECEIVING_UNIT_FIELD_NAMES ?? ["收票单位", "报销单位"]);
 
-  if (!amountField) {
+  if (!approvalAmount) {
     throw new BusinessError("Cannot parse approval amount field", "APPROVAL_AMOUNT_FIELD_NOT_FOUND", {
       configuredNames: config.APPROVAL_AMOUNT_FIELD_NAMES,
       availableFields: fields.map((field) => field.name),
@@ -59,12 +61,20 @@ export const parseApprovalForm = (
     approvalName: detail.approvalName,
     applicantId: applicant.id ?? detail.applicantId,
     applicantName: applicant.name ?? detail.applicantName,
-    approvalAmount: normalizeMoney(unwrapMoneyValue(amountField.value)),
+    approvalAmount,
+    receivingUnit: firstTextValue(receivingUnitField?.value),
     attachments,
     handlerOpenIds: parsePersonOpenIds(handlerField?.value),
     applicantDepartmentIds: detail.applicantDepartmentIds ?? [],
     currentApprovers: detail.currentApprovers ?? [],
   };
+};
+
+const firstTextValue = (input: unknown): string | undefined => {
+  const parsed = parseMaybeJson(input);
+  if (typeof parsed === "string" && parsed.trim()) return parsed.trim();
+  if (Array.isArray(parsed)) return parsed.find((item): item is string => typeof item === "string" && Boolean(item.trim()))?.trim();
+  return undefined;
 };
 
 const parsePersonOpenIds = (input: unknown): string[] => {
@@ -131,7 +141,19 @@ const normalizeFieldNode = (node: unknown): FormField[] => {
 const normalizeAttachments = (input: unknown, documentType: NormalizedAttachment["documentType"]): NormalizedAttachment[] => {
   const parsed = parseMaybeJson(input);
   const candidates = Array.isArray(parsed) ? parsed : [parsed];
-  return candidates.flatMap((candidate) => extractAttachmentCandidates(candidate, documentType));
+  return candidates
+    .flatMap((candidate) => extractAttachmentCandidates(candidate, documentType))
+    .filter((attachment) => documentType !== "INVOICE" || !isSpreadsheetAttachment(attachment));
+};
+
+const isSpreadsheetAttachment = (attachment: NormalizedAttachment): boolean => {
+  const name = attachment.name?.trim() ?? "";
+  const mimeType = attachment.mimeType?.trim().toLowerCase() ?? "";
+  return /\.(?:xlsx?|xlsm|xlsb|csv)$/iu.test(name)
+    || mimeType === "text/csv"
+    || mimeType === "application/vnd.ms-excel"
+    || mimeType.startsWith("application/vnd.openxmlformats-officedocument.spreadsheetml")
+    || mimeType.startsWith("application/vnd.ms-excel.");
 };
 
 const extractAttachmentCandidates = (input: unknown, documentType: NormalizedAttachment["documentType"]): NormalizedAttachment[] => {
@@ -182,7 +204,7 @@ const extractAttachmentCandidates = (input: unknown, documentType: NormalizedAtt
 
 const parseApplicant = (input: unknown): { id?: string; name?: string } => {
   const parsed = parseMaybeJson(input);
-  if (typeof parsed === "string") return { name: parsed };
+  if (typeof parsed === "string") return isLikelyUserId(parsed) ? {} : { name: parsed };
   if (!isRecord(parsed)) return {};
   return {
     id: firstString(parsed, ["id", "user_id", "userId", "open_id", "openId"]),
@@ -193,6 +215,38 @@ const parseApplicant = (input: unknown): { id?: string; name?: string } => {
 const findByNames = (fields: FormField[], names: string[]): FormField | undefined => {
   const normalizedNames = names.map((name) => name.trim().toLowerCase());
   return fields.find((field) => normalizedNames.includes(field.name.trim().toLowerCase()));
+};
+
+const findByPreferredNames = (fields: FormField[], names: string[]): FormField | undefined => {
+  for (const name of names) {
+    const normalizedName = name.trim().toLowerCase();
+    const field = fields.find((item) => item.name.trim().toLowerCase() === normalizedName);
+    if (field) return field;
+  }
+  return undefined;
+};
+
+const resolveApprovalAmount = (fields: FormField[], configuredNames: string[]): string | undefined => {
+  const explicitTotalNames = configuredNames.filter((name) => name.includes("汇总") || name.includes("合计") || name === "报销金额");
+  const explicitTotal = findByPreferredNames(fields, explicitTotalNames);
+  if (explicitTotal) return normalizeMoney(unwrapMoneyValue(explicitTotal.value));
+
+  const expenseDetails = fields.find((field) => ["费用明细", "报销明细"].includes(field.name.trim()));
+  if (expenseDetails && Array.isArray(expenseDetails.value)) {
+    const rowAmounts = expenseDetails.value.flatMap((row) => {
+      const rowFields = Array.isArray(row)
+        ? row.flatMap((item) => normalizeFieldNode(item))
+        : normalizeFieldNode(row);
+      const amount = findByPreferredNames(rowFields, ["金额", "报销金额", "实付金额"]);
+      return amount ? [normalizeMoney(unwrapMoneyValue(amount.value))] : [];
+    });
+    if (rowAmounts.length === expenseDetails.value.length && rowAmounts.length > 0) {
+      return centsToDecimal(rowAmounts.reduce((sum, amount) => sum + decimalToCents(amount), 0));
+    }
+  }
+
+  const fallback = findByPreferredNames(fields, configuredNames);
+  return fallback ? normalizeMoney(unwrapMoneyValue(fallback.value)) : undefined;
 };
 
 const findAllByNames = (fields: FormField[], names: string[]): FormField[] => {
